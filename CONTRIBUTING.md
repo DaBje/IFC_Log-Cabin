@@ -47,7 +47,7 @@ Or open a Pull Request on github.com/DaBje/IFC_Log-Cabin if you want a review be
 ### 7. Tag the release (repo owner only)
 Both commands use the same version number — `git tag` creates the tag locally, `git push origin` sends it to GitHub:
 ```
-git tag v1.0.0
+git tag v1.0.0 -m "Short description of version"
 git push origin v1.0.0
 ```
 
