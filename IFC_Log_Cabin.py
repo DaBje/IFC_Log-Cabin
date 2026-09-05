@@ -84,8 +84,19 @@ class Log:
     are assigned by generate_cabin from the course schedule:
 
       groove  - (drop, r_below_at_p0, r_below_at_p1) or None
-      notches - list of (distance along axis, drop, radius of crossing log)
+      notches - list of (distance along axis, drop, radius of crossing log,
+                cap) where cap limits the cut to a flat already sawn on the
+                crossing member, or None for a full round
       flat_z  - world height to flatten the top to, or None
+      flat_span - (from, to) along the axis over which flat_z applies in
+                full, or None for the whole length
+      flat_shoulders - ((radius, axis height), (radius, axis height)) of the
+                logs resting on top at each end of flat_span, whose undersides
+                the flat runs out along. None steps straight back to full round
+      floor_z - world height to saw the underside flat at, or None
+      side_flats - list of (offset along axis, half length, a_min, a_max)
+                chiselled pads that truncate the section sideways rather than
+                from above or below - a flat seat for a bracket
     """
 
     def __init__(self, p0, p1, r_butt, r_top, rng, bow, radial_jitter, bow_vertical=0.25):
@@ -119,7 +130,10 @@ class Log:
         self.groove = None
         self.notches = []
         self.flat_z = None
+        self.flat_span = None
+        self.flat_shoulders = None
         self.floor_z = None
+        self.side_flats = []
 
     def axis_point(self, t):
         return self.p0.lerp(self.p1, t) + self.bow_vec * math.sin(math.pi * t)
@@ -137,7 +151,7 @@ class Log:
 # --------------------------------------------------------------------------
 
 
-def _floor_samples(r, breaks, count):
+def _floor_samples(low, high, breaks, count):
     """`count` positions across the log, with every break landing exactly.
 
     A cut's rim - where it meets the barrel - is a crease. Sampling straight
@@ -149,11 +163,11 @@ def _floor_samples(r, breaks, count):
     if count <= 0:
         return []
 
-    inner = sorted(b for b in breaks if -r + 1e-6 < b < r - 1e-6)
+    inner = sorted(b for b in breaks if low + 1e-6 < b < high - 1e-6)
     if len(inner) >= count:
         return inner[:count]
 
-    knots = [-r] + inner + [r]
+    knots = [low] + inner + [high]
     widths = [knots[i + 1] - knots[i] for i in range(len(knots) - 1)]
 
     shares = [0] * len(widths)
@@ -171,6 +185,60 @@ def _floor_samples(r, breaks, count):
     return sorted(points)
 
 
+def _param_along(log, axis, coord):
+    """Where a coordinate falls along a log, as a parameter in [0, 1]."""
+    if axis == "X":
+        span = log.p1.x - log.p0.x
+        start = log.p0.x
+    else:
+        span = log.p1.y - log.p0.y
+        start = log.p0.y
+    if abs(span) < 1e-9:
+        return 0.0
+    return min(max((coord - start) / span, 0.0), 1.0)
+
+
+def _sweep_angles(start, end, breaks, count):
+    """`count` angles from start to end inclusive, landing on every break.
+
+    The barrel is swept by angle to keep it round, so a flat sawn across the
+    top meets it at two definite angles. Without vertices there the crease
+    runs diagonally over a quad and the flat's edge looks torn.
+    """
+    if count < 2:
+        return [start] * count
+
+    even = [start + (end - start) * i / (count - 1) for i in range(count)]
+    inner = sorted(b for b in breaks if start + 1e-6 < b < end - 1e-6)
+
+    # A flat gives exactly two rims. Reserve a fixed vertex index for each and
+    # interpolate within the three spans, so the crease keeps the same index
+    # from ring to ring and runs straight down the log. Sharing the vertices
+    # out by width instead - however sensible per ring - lets the allocation
+    # shift by one as phi0 swings through a notch, which moves the rim to a
+    # neighbouring index and steps the edge sideways.
+    if len(inner) != 2:
+        return even
+
+    shoulder = max(1, (count - 1) // 4)
+    middle = count - 1 - 2 * shoulder
+    if middle < 1:
+        return even
+
+    low, high = inner
+    angles = []
+    for i in range(count):
+        if i <= shoulder:
+            angles.append(start + (low - start) * i / shoulder)
+        elif i <= shoulder + middle:
+            angles.append(low + (high - low) * (i - shoulder) / middle)
+        else:
+            angles.append(
+                high + (end - high) * (i - shoulder - middle) / shoulder
+            )
+    return angles
+
+
 def _ring_points(log, t, along, gap, n_up, n_low):
     """The log's outline at one station, as (a, b) in its own frame.
 
@@ -182,17 +250,51 @@ def _ring_points(log, t, along, gap, n_up, n_low):
     r = log.radius(t)
     centre = log.axis_point(t)
 
-    ceiling = None if log.flat_z is None else log.flat_z - centre.z
+    # A top flat can be limited to part of the length. A floor beam is sawn
+    # flat only between the walls; what projects outside stays a full round,
+    # the way an overhanging corner log does.
+    ceiling = None
+    if log.flat_z is not None:
+        top = log.flat_z
+        if log.flat_span is not None:
+            low, high = log.flat_span
+            if along < low or along > high:
+                # Past the wall axis the flat runs out along the underside of
+                # the log bearing on it, rather than ending in a sawn cliff.
+                # The two surfaces stay in contact the whole way, because this
+                # follows the very cylinder the log above presents.
+                if log.flat_shoulders is None:
+                    top = None
+                else:
+                    near, far = log.flat_shoulders
+                    if along < low:
+                        reach, (radius, above_z) = low - along, near
+                    else:
+                        reach, (radius, above_z) = along - high, far
+                    if reach >= radius:
+                        top = None  # clear of the log above; full round again
+                    else:
+                        top = max(
+                            top, above_z - math.sqrt(radius * radius - reach * reach)
+                        )
+        # Once the cut would sit above the crown it is not cutting at all.
+        if top is not None and top - centre.z < r:
+            ceiling = top - centre.z
 
     # Saddle notches. A perpendicular log removes a horizontal slab, so its
     # contribution to the floor is a constant, not a curve.
     line_top = None
-    for offset, drop, radius in log.notches:
+    for offset, drop, radius, cap in log.notches:
         reach = radius + gap
         span = reach * reach - (along - offset) ** 2
         if span <= 0.0:
             continue  # this station clears the crossing
         top = math.sqrt(span) - drop
+        # A member that has itself been flattened on top is not a full round,
+        # so the notch over it stops at that flat instead of following a
+        # cylinder that is no longer there.
+        if cap is not None and top > cap:
+            top = cap
         if line_top is None or top > line_top:
             line_top = top
 
@@ -243,22 +345,36 @@ def _ring_points(log, t, along, gap, n_up, n_low):
             if u > 0.0:
                 groove_rim = math.sqrt(u)
 
-    # The outermost rim is the section's shoulder, and it is always carried by
-    # the sweep's two endpoints - at any cut depth, above or below the axis.
-    # Letting it migrate between the sweep and the floor samples, which is
-    # what happened while only notches biting above the axis shortened the
-    # sweep, hands the rim to a different vertex index from one ring to the
-    # next. The strip between two such rings jogs sideways by a vertex, and
-    # that is what reads as a staircase along the edge.
-    outer = [rim for rim in (notch_rim, groove_rim) if rim is not None]
-    a_rim = max(r * 1e-3, min(r, max(outer))) if outer else r
+    # The section's half-width, where the sweep hands over to the floor.
+    #
+    # While every cut stays at or below the axis the material still reaches
+    # +/-r, so that hand-over point is free to choose and the horizontal
+    # extremes are the balanced choice: the sweep takes the upper half, the
+    # floor takes the lower, and each cut shows up as a crease within the
+    # floor rather than as the shoulder itself.
+    #
+    # Only a cut biting above the axis - which a saddle notch does, by
+    # scribe_depth/2 - genuinely removes the shoulders, and then the outline
+    # has to stop at the rim.
+    #
+    # Anchoring it to the rim in every case is what tore the surface at a
+    # notch mouth: there line_top approaches -r, so sqrt(r^2 - line_top^2)
+    # collapses towards zero and every floor vertex piles into a few
+    # millimetres while the next ring along spreads them over the full width.
+    # This way the parameterisation stays continuous as a notch fades out,
+    # because at line_top = 0 both branches give the same answer.
+    if line_top is not None and line_top > 0.0:
+        a_rim = max(r * 1e-3, notch_rim if notch_rim is not None else r)
+    else:
+        a_rim = r
 
-    # Creases strictly inside the section still need vertices of their own.
-    # _floor_samples drops anything at the shoulder, so the outer rim falls
-    # away here on its own and only the inner one survives.
+    # Creases inside the section still need vertices of their own.
+    # _floor_samples drops anything sitting at the shoulder, so a rim that has
+    # become the shoulder falls away here on its own.
     breaks = []
-    for rim in outer:
-        breaks.extend((-rim, rim))
+    for rim in (notch_rim, groove_rim):
+        if rim is not None:
+            breaks.extend((-rim, rim))
     if groove is not None and line_top is not None:
         # Where the notch takes over from the groove. The floor is the upper
         # of the two, and they cross in a crease running along the notch.
@@ -268,20 +384,41 @@ def _ring_points(log, t, along, gap, n_up, n_low):
             edge = math.sqrt(r_groove * r_groove - height * height)
             breaks.extend((-edge, edge))
 
-    # Sweep the barrel from one shoulder, over the crown, to the other. The
-    # shoulder lies on the circle, so atan2 gives its angle directly and the
+    # A chiselled pad truncates the section sideways rather than from above or
+    # below - the only cut that limits `a` instead of `b`. The vertical face it
+    # leaves needs no vertices of its own: the ring closes from the last sweep
+    # point to the first floor point, and that edge is the pad.
+    a_left, a_right = -a_rim, a_rim
+    for offset, half_length, low_limit, high_limit in log.side_flats:
+        if abs(along - offset) > half_length:
+            continue
+        a_left = max(a_left, low_limit)
+        a_right = min(a_right, high_limit)
+    if a_right - a_left < r * 0.05:
+        a_left, a_right = -a_rim, a_rim  # a pad that deep would sever the log
+
+    # Sweep the barrel from one shoulder, over the crown, to the other. Each
+    # shoulder lies on the circle, so atan2 gives its angle directly, and the
     # sweep runs past the horizontal whenever the cut sits below the axis.
-    phi0 = math.atan2(lower(a_rim), a_rim)
-    sweep = math.pi - 2.0 * phi0
+    def shoulder(edge):
+        return math.atan2(math.sqrt(max(0.0, r * r - edge * edge)), edge)
+
+    phi0 = shoulder(a_right)
+    sweep = shoulder(a_left) - phi0
+
+    # Where the top flat meets the barrel, so the sweep lands on it.
+    crown = []
+    if ceiling is not None and -r < ceiling < r:
+        rim = math.asin(min(1.0, max(-1.0, ceiling / r)))
+        crown = [rim, math.pi - rim]
 
     points = []
-    for k in range(n_up):
-        phi = phi0 + sweep * k / (n_up - 1)
+    for phi in _sweep_angles(phi0, phi0 + sweep, crown, n_up):
         b = r * math.sin(phi)
         points.append(
             (r * math.cos(phi), b if ceiling is None else min(b, ceiling))
         )
-    for a in _floor_samples(a_rim, breaks, n_low):
+    for a in _floor_samples(a_left, a_right, breaks, n_low):
         # a_rim already keeps the floor below the ceiling; the clamp is only a
         # guard against the outline crossing itself if the two ever meet.
         points.append((a, min(lower(a), upper(a))))
@@ -297,7 +434,7 @@ def _station_params(log, axial, refine):
     """
     params = {round(i / axial, 6) for i in range(axial + 1)}
     if log.length > 1e-9:
-        for offset, _drop, radius in log.notches:
+        for offset, _drop, radius, _cap in log.notches:
             # The notch floor is sqrt(R^2 - e^2), whose slope runs away at the
             # mouth. Sampling evenly along the log therefore spends stations
             # on the crown, which is nearly flat, and starves the mouth, which
@@ -318,6 +455,40 @@ def _station_params(log, axial, refine):
                 param = (edge + outward * 0.004) / log.length
                 if 0.0 <= param <= 1.0:
                     params.add(round(param, 6))
+
+        # Where a top flat starts and stops, the ring's topology changes: two
+        # of its vertices become pinned to the flat's rim. Pinning stations
+        # either side confines that change to a few millimetres so it reads as
+        # an edge rather than a smeared, torn strip.
+        if log.flat_span is not None:
+            for edge in log.flat_span:
+                for nudge in (-0.002, 0.002):
+                    param = (edge + nudge) / log.length
+                    if 0.0 <= param <= 1.0:
+                        params.add(round(param, 6))
+
+            # The flat runs out along the underside of the log above, so that
+            # stretch needs its own stations. Stepping by angle gathers them
+            # towards the outer end, where sqrt(R^2 - d^2) turns hardest.
+            if log.flat_shoulders is not None:
+                low, high = log.flat_span
+                near, far = log.flat_shoulders
+                ends = ((low, near, -1.0), (high, far, 1.0))
+                for edge, (radius, above_z), outward in ends:
+                    for k in range(refine + 1):
+                        reach = radius * math.sin(math.pi * 0.5 * k / refine)
+                        param = (edge + outward * reach) / log.length
+                        if 0.0 <= param <= 1.0:
+                            params.add(round(param, 6))
+
+                    # And one where that curve lifts clear of the flat, which
+                    # is a crease between two different surfaces.
+                    rise = above_z - log.flat_z
+                    if 0.0 < rise < radius:
+                        reach = math.sqrt(radius * radius - rise * rise)
+                        param = (edge + outward * reach) / log.length
+                        if 0.0 <= param <= 1.0:
+                            params.add(round(param, 6))
 
     # Rounding alone can still leave stations a micrometre apart, and a ring
     # pair that close makes zero-area quads that shade black.
@@ -378,6 +549,90 @@ def build_log_mesh(log, axial, radial, gap, refine):
         faces.append((start_centre, j_next, j))
         faces.append((end_centre, last + j, last + j_next))
 
+    return verts, faces
+
+
+def build_box_mesh(lo, hi):
+    """Axis-aligned box from two opposite corners. Sawn timber and brackets."""
+    verts = [
+        Vector((lo.x, lo.y, lo.z)),
+        Vector((hi.x, lo.y, lo.z)),
+        Vector((hi.x, hi.y, lo.z)),
+        Vector((lo.x, hi.y, lo.z)),
+        Vector((lo.x, lo.y, hi.z)),
+        Vector((hi.x, lo.y, hi.z)),
+        Vector((hi.x, hi.y, hi.z)),
+        Vector((lo.x, hi.y, hi.z)),
+    ]
+    faces = [
+        (0, 3, 2, 1),
+        (4, 5, 6, 7),
+        (0, 1, 5, 4),
+        (1, 2, 6, 5),
+        (2, 3, 7, 6),
+        (3, 0, 4, 7),
+    ]
+    return verts, faces
+
+
+def _frame_point(along_y):
+    """Map (along, across, z) into world space, for members running one way."""
+    if along_y:
+        return lambda along, across, z: Vector((across, along, z))
+    return lambda along, across, z: Vector((along, across, z))
+
+
+def _frame_place(along_y):
+    """The same mapping, for the two opposite corners of a box."""
+    put = _frame_point(along_y)
+
+    def place(along0, along1, across0, across1, z0, z1):
+        return put(along0, across0, z0), put(along1, across1, z1)
+
+    return place
+
+
+def _even_run(first, last, pitch):
+    """Member centres from first to last inclusive, on pitch where it fits.
+
+    The two end bays take up whatever does not divide evenly. They are made as
+    large as the pitch allows rather than as small as possible: packing in the
+    maximum number of full bays can leave a remainder of a few millimetres and
+    two members almost touching.
+    """
+    span = last - first
+    if span <= 1e-6:
+        return [(first + last) * 0.5]
+    if span <= pitch:
+        return [first, last]
+
+    full = max(0, math.ceil((span - 2.0 * pitch) / pitch))
+    edge = (span - full * pitch) * 0.5
+    run = [first]
+    run.extend(first + edge + i * pitch for i in range(full + 1))
+    run.append(last)
+    return run
+
+
+def build_prism(profile, caps, low, high, point):
+    """Extrude a 2D (along, z) profile between two positions across it.
+
+    `caps` are index tuples tiling the profile into quads. They are supplied
+    rather than derived because these profiles are non-convex - a rebated beam
+    end, an L-shaped bracket - and the IFC tessellator fans from vertex 0,
+    which triangulates a non-convex polygon wrongly.
+    """
+    count = len(profile)
+    verts = [point(along, low, z) for along, z in profile]
+    verts += [point(along, high, z) for along, z in profile]
+
+    faces = []
+    for i in range(count):
+        j = (i + 1) % count
+        faces.append((i, j, count + j, count + i))
+    for cap in caps:
+        faces.append(tuple(reversed(cap)))
+        faces.append(tuple(count + i for i in cap))
     return verts, faces
 
 
@@ -574,6 +829,7 @@ def generate_cabin(props):
         return _lerp(r_butt, r_top, min(max(u, 0.0), 1.0))
 
     records = []
+    by_course = {}  # course -> [(log, line, wall_index)], for tying the floor in
     for course in range(max_courses):
         below = lines_at(course - 1)
         two_below = {index for index, _line in lines_at(course - 2)}
@@ -619,6 +875,7 @@ def generate_cabin(props):
                         offset,
                         half_rise,
                         radius_at(cross, course - 1, cross_index, line.position),
+                        None,
                     )
                 )
 
@@ -634,12 +891,436 @@ def generate_cabin(props):
                 log.flat_z = course_z(course) + pair / 2.0 - props.top_flat_depth
 
             records.append((log, line.name, course))
+            by_course.setdefault(course, []).append((log, line, wall_index))
+
+    # ---- floor structure -------------------------------------------------
+    # Joists span between two opposite sills. Which sills depends on their
+    # direction, and the two sill courses sit half a round apart, so the whole
+    # floor rides at whatever height its bearers are at.
+    joists = []
+    boxes = []
+    floor_piles = []
+
+    if props.floor_type != "NONE":
+        mean_r = pair / 2.0
+        along_y = props.joist_axis == "Y"
+
+        if along_y:
+            bearer_course = 0  # the X walls
+            span_end = props.width
+            free_end = props.length
+        else:
+            bearer_course = 1  # the Y walls
+            span_end = props.length
+            free_end = props.width
+
+        # Every line at that course runs perpendicular to the joists, so this
+        # picks up internal walls as well as the two external sills. A joist
+        # crossing an internal wall gets notched over it just the same.
+        bearers = lines_at(bearer_course)
+
+        # The real sill logs, so the floor can be cut to the surfaces that are
+        # actually there rather than to the nominal schedule. A beam is
+        # thinner than what it beds on, so a neighbour's jitter and bow - up
+        # to about a centimetre - would otherwise show as the beam sinking in.
+        bearer_logs = {
+            index: (member, line)
+            for member, line, index in by_course.get(bearer_course, [])
+        }
+        walls = (0, 1) if along_y else (2, 3)
+
+        sill_z = course_z(bearer_course)
+
+        place = _frame_place(along_y)
+        point = _frame_point(along_y)
+
+        def add_box(name, lo, hi, kind):
+            verts, faces = build_box_mesh(lo, hi)
+            boxes.append((name, verts, faces, kind))
+
+        def lay_sheets(label, frame, carriers, along_span, across_span, base, phase):
+            """One layer of sheets over whatever members carry it.
+
+            Each layer names its own carriers and direction, because they are
+            not always the same: under a notched floor the lower sheet rides
+            the logs, while the upper one rides the beams crossing them.
+            """
+            if not carriers:
+                return
+            put = _frame_place(frame)
+            wide, long = props.sheet_width, props.sheet_length
+            along_lo, along_hi = along_span
+            across_lo, across_hi = across_span
+
+            # Every seam running along the carriers lands on one, so both
+            # sheets meeting there are supported. Take the furthest carrier
+            # still within a sheet of the last seam rather than stepping a
+            # fixed width. Where the carriers are further apart than a sheet -
+            # the floor logs at 2 m - it falls back to a floating seam.
+            bounds = [across_lo]
+            for _ in range(len(carriers) + 2):
+                if across_hi - bounds[-1] <= wide + 1e-6:
+                    break
+                nxt = None
+                for centre in carriers:
+                    if centre <= bounds[-1] + 1e-6:
+                        continue
+                    if centre - bounds[-1] > wide + 1e-6:
+                        break
+                    nxt = centre
+                bounds.append(bounds[-1] + wide if nxt is None else nxt)
+            bounds.append(across_hi)
+
+            for row, (edge_a, edge_b) in enumerate(zip(bounds, bounds[1:])):
+                if edge_b - edge_a <= 1e-6:
+                    continue
+                # Stagger alternate rows by half a sheet so the cross joints
+                # break rather than running the length of the floor. The phase
+                # also offsets one layer from the other.
+                cursor = along_lo - ((row + phase) % 2) * long * 0.5
+                column = 0
+                while cursor < along_hi - 1e-6:
+                    start = max(cursor, along_lo)
+                    stop = min(cursor + long, along_hi)
+                    cursor += long
+                    if stop - start <= 1e-6:
+                        continue
+                    column += 1
+                    add_box(
+                        f"{label}_{row + 1:02d}_{column:02d}",
+                        *put(
+                            start, stop, edge_a, edge_b,
+                            base, base + props.sheet_thickness,
+                        ),
+                        "sheet",
+                    )
+
+        if props.floor_type == "NOTCHED":
+            # The outermost logs sit a set distance in from the walls, centre
+            # to centre, and the run between them is on the nominal pitch with
+            # the end bays absorbing the remainder - the bracket joists' rule
+            # at a longer pitch, since these are primary members.
+            positions = _even_run(
+                props.log_beam_offset,
+                free_end - props.log_beam_offset,
+                props.log_beam_spacing,
+            )
+        else:
+            # Bracket-hung joists are board-led. The outermost pair sits a
+            # fixed gap off its wall; the run between them is on the nominal
+            # pitch, with the two end bays absorbing whatever does not divide
+            # evenly. Squeezing those two rather than spreading the error over
+            # every bay keeps the boards on a true 60 cm grid across the room,
+            # and no bay ends up wider than the pitch.
+            inset = mean_r + props.joist_wall_gap + props.joist_width / 2.0
+            positions = _even_run(
+                inset, free_end - inset, props.joist_spacing
+            )
+
+        # Where the deck lands, what carries it, and which way those members
+        # run. The bracket version mills the sills, which moves the wall face
+        # along the beams inward.
+        deck_layers = []
+        face = mean_r
+
+        if props.floor_type == "NOTCHED":
+            r_joist = props.joist_diameter / 2.0
+            axis_z = sill_z + half_rise  # a course above its bearer, as a wall log would be
+
+            # Only a quarter of the diameter comes off the top. Sawing down to
+            # the middle would leave a thin plank of what ought to be a beam.
+            joist_flat = (
+                axis_z + r_joist - props.joist_diameter * props.joist_flat_share
+            )
+
+            # The wall course that comes to rest on the beams.
+            above_course = bearer_course + 2
+            above_axis_z = course_z(above_course)
+
+            # Wall logs are cut to each other from the schedule, since every
+            # log in a course is the same nominal size. A beam is not: it is
+            # thinner than what it beds on, so the neighbour's jitter and bow
+            # - up to about a centimetre - show up as the beam sinking into
+            # the log it rests on. These are the real logs, so the beams can
+            # be cut to the surfaces that are actually there.
+            above_logs = {
+                index: (member, line)
+                for member, line, index in by_course.get(above_course, [])
+            }
+
+            for index, pos in enumerate(positions):
+                # Run past the wall axes so each beam is let into the sill and
+                # ends inside it, rather than stopping on the centreline.
+                tie = props.joist_overhang
+                start, end = place(
+                    -tie, span_end + tie, pos, pos, axis_z, axis_z
+                )
+                log = Log(
+                    start,
+                    end,
+                    r_joist,
+                    r_joist,
+                    rng,
+                    props.bow,
+                    props.radial_jitter,
+                    props.bow_vertical,
+                )
+                log.flat_z = joist_flat
+                # The flat is full between the wall axes. Past them it runs
+                # out along the underside of the log bearing on the beam,
+                # instead of ending in a sawn cliff, and the projecting end
+                # comes back to a full round like an overhanging corner log.
+                log.flat_span = (tie, tie + span_end)
+                shoulders = []
+                for wall_index in walls:
+                    entry = above_logs.get(wall_index)
+                    if entry is None:
+                        shoulders.append((mean_r, above_axis_z))
+                        continue
+                    member, line_above = entry
+                    u = _param_along(member, line_above.axis, pos)
+                    shoulders.append(
+                        (member.radius(u), member.axis_point(u).z)
+                    )
+                log.flat_shoulders = tuple(shoulders)
+
+                origin = start.y if along_y else start.x
+                heading = log.dir.y if along_y else log.dir.x
+                for bearer_index, bearer in bearers:
+                    if not bearer.covers(pos):
+                        continue  # that wall does not reach this joist
+                    offset = (bearer.position - origin) * heading
+                    if offset < -r_joist or offset > log.length + r_joist:
+                        continue  # crossing lies off the end of this joist
+
+                    entry = bearer_logs.get(bearer_index)
+                    if entry is None:
+                        drop, radius = half_rise, mean_r
+                    else:
+                        member, _line = entry
+                        u = _param_along(member, bearer.axis, pos)
+                        drop = axis_z - member.axis_point(u).z
+                        radius = member.radius(u)
+                    log.notches.append((offset, drop, radius, None))
+                joists.append((log, f"Joist_{index + 1:02d}"))
+
+                # Piles under the joist, on the same grid as the perimeter, so
+                # no unsupported span exceeds Max Pile Span. The joist ends
+                # bear on the sills, which carry their own piles already.
+                segments = max(1, math.ceil(span_end / props.max_span))
+                for step in range(1, segments):
+                    coord = span_end * step / segments
+                    point = (pos, coord) if along_y else (coord, pos)
+                    floor_piles.append((round(point[0], 4), round(point[1], 4)))
+
+            # The joists stand proud of the sills, so the wall course above has
+            # to be notched over them - and that notch is what actually ties
+            # the floor into the wall. The cut stops at the beam's sawn flat,
+            # since there is no longer a full round up there to follow.
+            joist_axis = "Y" if along_y else "X"
+            for log_above, line_above, index_above in by_course.get(
+                above_course, []
+            ):
+                if not 0.0 <= line_above.position <= span_end:
+                    continue  # that wall does not pass over the joists
+                start_above, _end_above = ends(
+                    line_above, bearer_course + 2, index_above
+                )
+                origin_above = start_above.x if along_y else start_above.y
+                heading_above = log_above.dir.x if along_y else log_above.dir.y
+                for joist_index, pos in enumerate(positions):
+                    if not line_above.covers(pos):
+                        continue
+                    beam = joists[joist_index][0]
+                    # Both sides measured on the real members, so the seating
+                    # matches what the beam was actually cut to.
+                    u = _param_along(log_above, line_above.axis, pos)
+                    v = _param_along(beam, joist_axis, line_above.position)
+                    crown = log_above.axis_point(u).z
+                    log_above.notches.append(
+                        (
+                            (pos - origin_above) * heading_above,
+                            crown - beam.axis_point(v).z,
+                            beam.radius(v),
+                            joist_flat - crown,
+                        )
+                    )
+
+            # The logs are too far apart for boards to span, so sawn beams run
+            # across them, turned through ninety degrees. Same layering as the
+            # bracket floor above this point, minus the brackets: these simply
+            # bear on the logs' sawn flats.
+            cross = _frame_place(not along_y)
+            half_width = props.joist_width / 2.0
+            cross_inset = mean_r + props.joist_wall_gap + half_width
+            cross_at = _even_run(
+                cross_inset, span_end - cross_inset, props.joist_spacing
+            )
+            cross_lo, cross_hi = mean_r, free_end - mean_r
+
+            # A sheet goes down on the logs first, so the beams start one
+            # thickness higher. The void it closes off between the beams is
+            # what takes the insulation.
+            sheet = props.sheet_thickness if props.add_deck else 0.0
+            beam_base = joist_flat + sheet
+
+            for index, seat in enumerate(cross_at):
+                lo, hi = cross(
+                    cross_lo, cross_hi,
+                    seat - half_width, seat + half_width,
+                    beam_base, beam_base + props.joist_depth,
+                )
+                add_box(f"Beam_{index + 1:02d}", lo, hi, "joist")
+
+            # Both layers are set out to the beams, even though the lower one
+            # rests on the logs. Its seams then run directly under a beam,
+            # which pins both sheets meeting there - better than setting it
+            # out to logs 2 m apart, where no seam could reach one at all.
+            deck_run = (cross_lo, cross_hi)
+            deck_bays = (mean_r, span_end - mean_r)
+            deck_layers = [
+                ("SheetUnder", not along_y, cross_at, deck_run, deck_bays,
+                 joist_flat, 1),
+                ("Sheet", not along_y, cross_at, deck_run, deck_bays,
+                 beam_base + props.joist_depth, 0),
+            ]
+
+        else:  # BRACKET
+            half_width = props.joist_width / 2.0
+            plate = props.bracket_thickness
+            # A sheet goes on underneath as well, so the structure rides one
+            # sheet thickness up and that lower sheet finishes flush with the
+            # foundation top - which is also the underside of the lowest wall
+            # course.
+            underside = props.sheet_thickness if props.add_deck else 0.0
+            joist_top = underside + props.joist_depth
+
+            # Mill the inner face of the sills the brackets bear against, down
+            # their whole length, so there is a true surface to bolt to. Only
+            # the bracket version gets this: a notched beam beds on the log's
+            # own round surface and wants no flat. Doing it per bracket
+            # instead changed the section abruptly at each pad's ends, which
+            # tore the mesh; a continuous flat has no such transition, and
+            # running the mill down the log once is what a builder would do.
+            face = max(0.0, mean_r - props.bracket_mill)
+            for wall_index in walls:
+                entry = bearer_logs.get(wall_index)
+                if entry is None:
+                    continue
+                member, line = entry
+                across = (
+                    Vector((0.0, 1.0, 0.0))
+                    if line.axis == "X"
+                    else Vector((1.0, 0.0, 0.0))
+                )
+                # Which side of the log faces indoors, in its own frame. Butt
+                # alternation flips that frame, so it has to be measured.
+                indoors = 1.0 if line.position <= 0.5 * span_end else -1.0
+                limit = indoors * face * across.dot(member.side)
+                reach = 1e3 if limit < 0.0 else -1e3
+                member.side_flats.append(
+                    (
+                        member.length * 0.5,
+                        member.length,
+                        min(limit, reach),
+                        max(limit, reach),
+                    )
+                )
+
+            # Everything is measured out from the milled face. The beam is
+            # rebated around the bracket rather than perched on it, so their
+            # end faces and their undersides finish in the same planes - which
+            # is what lets a sheet lie flat under the pair of them.
+            bearing = props.joist_depth * 0.6
+            seat_top = underside + plate
+            plate_top = underside + props.joist_depth * 0.6
+
+            near_end, near_plate = face, face + plate
+            near_seat = near_plate + bearing
+            far_end = span_end - face
+            far_plate = far_end - plate
+            far_seat = far_plate - bearing
+
+            for index, pos in enumerate(positions):
+                # A stepped prism: narrow through the seat band, wider past
+                # the upright, full width clear of the bracket altogether.
+                profile = [
+                    (near_seat, underside),
+                    (far_seat, underside),
+                    (far_seat, seat_top),
+                    (far_plate, seat_top),
+                    (far_plate, plate_top),
+                    (far_end, plate_top),
+                    (far_end, joist_top),
+                    (near_end, joist_top),
+                    (near_end, plate_top),
+                    (near_plate, plate_top),
+                    (near_plate, seat_top),
+                    (near_seat, seat_top),
+                ]
+                verts, faces = build_prism(
+                    profile,
+                    [(0, 1, 2, 11), (10, 3, 4, 9), (8, 5, 6, 7)],
+                    pos - half_width,
+                    pos + half_width,
+                    point,
+                )
+                boxes.append((f"Joist_{index + 1:02d}", verts, faces, "joist"))
+
+                # One L-shaped bracket per end, rather than a seat and an
+                # upright meeting in mid air.
+                ends = (
+                    (near_end, near_plate, near_seat),
+                    (far_end, far_plate, far_seat),
+                )
+                for side, (outer, inner, tail) in enumerate(ends):
+                    profile = [
+                        (outer, underside),
+                        (tail, underside),
+                        (tail, seat_top),
+                        (inner, seat_top),
+                        (inner, plate_top),
+                        (outer, plate_top),
+                    ]
+                    verts, faces = build_prism(
+                        profile,
+                        [(0, 1, 2, 3), (0, 3, 4, 5)],
+                        pos - half_width - plate,
+                        pos + half_width + plate,
+                        point,
+                    )
+                    boxes.append(
+                        (
+                            f"Bracket_{index + 1:02d}{'AB'[side]}",
+                            verts,
+                            faces,
+                            "bracket",
+                        )
+                    )
+
+            # Both layers ride the same joists here, so both keep the same
+            # frame. Along the beams the wall face is the milled one.
+            bracket_along = (face, span_end - face)
+            bracket_across = (mean_r, free_end - mean_r)
+            deck_layers = [
+                ("Sheet", along_y, positions, bracket_along, bracket_across,
+                 joist_top, 0),
+                ("SheetUnder", along_y, positions, bracket_along,
+                 bracket_across, 0.0, 1),
+            ]
+
+        # ---- plywood ---------------------------------------------------
+        if props.add_deck:
+            for layer in deck_layers:
+                lay_sheets(*layer)
 
     piles = []
     if props.pile_height > 0.0:
-        piles = list(pile_positions(props))
+        points = dict.fromkeys(pile_positions(props), True)
+        points.update(dict.fromkeys(floor_piles, True))
+        piles = sorted(points)
 
-    return records, piles
+    return records, piles, joists, boxes
 
 
 # --------------------------------------------------------------------------
@@ -804,6 +1485,136 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         description="Cut a level bearing surface on the uppermost log of each wall",
         default=False,
     )
+
+    # floor
+    floor_type: EnumProperty(
+        name="Floor",
+        items=[
+            ("NONE", "None", "No floor structure"),
+            (
+                "NOTCHED",
+                "Notched Logs",
+                (
+                    "Round joists notched into the sills exactly as an "
+                    "internal wall is, flattened on top to carry the boards"
+                ),
+            ),
+            (
+                "BRACKET",
+                "Joists on Brackets",
+                "Sawn rectangular joists carried on brackets fixed to the sills",
+            ),
+        ],
+        default="NOTCHED",
+    )
+    joist_axis: EnumProperty(
+        name="Joist Direction",
+        items=[
+            ("Y", "Along Y", "Joists span the width, bearing on the X walls"),
+            ("X", "Along X", "Joists span the length, bearing on the Y walls"),
+        ],
+        default="Y",
+    )
+    joist_spacing: FloatProperty(
+        name="Joist Spacing",
+        description=(
+            "Target centre-to-centre spacing. The real spacing divides the "
+            "span evenly, so it comes out at or below this"
+        ),
+        default=0.6,
+        min=0.15,
+        unit="LENGTH",
+    )
+    joist_diameter: FloatProperty(
+        name="Joist Diameter", default=0.20, min=0.05, unit="LENGTH"
+    )
+    log_beam_offset: FloatProperty(
+        name="Log Offset",
+        description="Centre of the outermost floor log, measured in from the wall",
+        default=0.5,
+        min=0.0,
+        unit="LENGTH",
+    )
+    log_beam_spacing: FloatProperty(
+        name="Log Spacing",
+        description=(
+            "Centre to centre for the floor logs. The bays either side of the "
+            "outermost pair take up whatever does not divide evenly"
+        ),
+        default=2.0,
+        min=0.3,
+        unit="LENGTH",
+    )
+    joist_overhang: FloatProperty(
+        name="Tie-in Overhang",
+        description=(
+            "How far each floor beam projects past the wall axis it notches "
+            "into. Keep it below the sill's radius and the end stays buried "
+            "in the sill instead of breaking out through the wall"
+        ),
+        default=0.20,
+        min=0.0,
+        unit="LENGTH",
+    )
+    joist_flat_share: FloatProperty(
+        name="Top Flat",
+        description=(
+            "How much of the joist's diameter is sawn off the top to carry "
+            "the boards. A quarter leaves a beam; a half leaves a plank"
+        ),
+        default=0.25,
+        min=0.0,
+        max=0.45,
+    )
+    add_deck: BoolProperty(
+        name="Plywood Deck",
+        description="Lay sheets over the floor structure, joints staggered",
+        default=True,
+    )
+    sheet_width: FloatProperty(
+        name="Sheet Width",
+        description="Across the beams",
+        default=1.2,
+        min=0.2,
+        unit="LENGTH",
+    )
+    sheet_length: FloatProperty(
+        name="Sheet Length",
+        description="Along the beams. Alternate rows shift by half of this",
+        default=2.0,
+        min=0.2,
+        unit="LENGTH",
+    )
+    sheet_thickness: FloatProperty(
+        name="Sheet Thickness", default=0.022, min=0.003, unit="LENGTH"
+    )
+    joist_wall_gap: FloatProperty(
+        name="Wall Gap",
+        description=(
+            "Clear gap between the outermost joist and the wall it runs "
+            "alongside. The bays either side of it take up whatever the "
+            "spacing does not divide evenly"
+        ),
+        default=0.10,
+        min=0.0,
+        unit="LENGTH",
+    )
+    joist_width: FloatProperty(name="Joist Width", default=0.10, min=0.02, unit="LENGTH")
+    joist_depth: FloatProperty(name="Joist Depth", default=0.20, min=0.05, unit="LENGTH")
+    bracket_thickness: FloatProperty(
+        name="Bracket Thickness", default=0.012, min=0.002, unit="LENGTH"
+    )
+    bracket_mill: FloatProperty(
+        name="Milled Face",
+        description=(
+            "How much is milled off the inner face of the sills the brackets "
+            "bolt to, along their whole length. Everything else - bracket, "
+            "joist ends - is measured out from that face"
+        ),
+        default=0.04,
+        min=0.0,
+        unit="LENGTH",
+    )
     top_flat_depth: FloatProperty(
         name="Top Flat Depth",
         description="How far down from the crown the flat is cut",
@@ -934,7 +1745,7 @@ class LOGCABIN_OT_generate(bpy.types.Operator):
         props = context.scene.log_cabin
 
         try:
-            records, piles = generate_cabin(props)
+            records, piles, joists, boxes = generate_cabin(props)
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -970,10 +1781,34 @@ class LOGCABIN_OT_generate(bpy.types.Operator):
             obj = _make_object(coll, f"Pile_{index:03d}", verts, faces, "pile")
             _apply_shading(obj, props.shade_smooth)
 
-        self.report(
-            {"INFO"},
-            f"Built {len(records)} logs and {len(piles)} piles.",
+        for log, name in joists:
+            verts, faces = build_log_mesh(
+                log,
+                props.axial_segments,
+                props.radial_segments,
+                props.scribe_gap,
+                props.notch_refine,
+            )
+            obj = _make_object(coll, name, verts, faces, "joist")
+            _apply_shading(obj, props.shade_smooth)
+
+        for name, verts, faces, kind in boxes:
+            # Sawn timber, brackets and sheets are genuinely faceted.
+            obj = _make_object(coll, name, verts, faces, kind)
+            _apply_shading(obj, False)
+
+        tally = {}
+        for entry in boxes:
+            tally[entry[3]] = tally.get(entry[3], 0) + 1
+        message = (
+            f"Built {len(records)} logs, {len(piles)} piles, "
+            f"{len(joists) + tally.get('joist', 0)} joists"
         )
+        if tally.get("bracket"):
+            message += f", {tally['bracket']} bracket parts"
+        if tally.get("sheet"):
+            message += f", {tally['sheet']} deck sheets"
+        self.report({"INFO"}, message + ".")
         return {"FINISHED"}
 
 
@@ -1112,6 +1947,7 @@ class LOGCABIN_OT_to_ifc(bpy.types.Operator):
         wall_count = 0
         member_count = 0
         footing_count = 0
+        floor_count = 0
 
         for obj in sorted(coll.objects, key=lambda o: o.name):
             kind = obj.get(TYPE_KEY)
@@ -1174,10 +2010,51 @@ class LOGCABIN_OT_to_ifc(bpy.types.Operator):
                 )
                 footing_count += 1
 
+            elif kind in ("joist", "bracket", "sheet"):
+                if kind == "joist":
+                    element = ifcopenshell.api.run(
+                        "root.create_entity",
+                        ifc,
+                        ifc_class="IfcBeam",
+                        predefined_type="JOIST",
+                        name=obj.name,
+                    )
+                elif kind == "sheet":
+                    # IfcPlate is the planar element of constant thickness,
+                    # which is what a sheet good is.
+                    element = ifcopenshell.api.run(
+                        "root.create_entity",
+                        ifc,
+                        ifc_class="IfcPlate",
+                        predefined_type="SHEET",
+                        name=obj.name,
+                    )
+                else:
+                    # IfcDiscreteAccessory is the fitting for a fixing that is
+                    # not itself structure - brackets, shoes, anchor plates.
+                    element = ifcopenshell.api.run(
+                        "root.create_entity",
+                        ifc,
+                        ifc_class="IfcDiscreteAccessory",
+                        name=obj.name,
+                    )
+                element.ObjectPlacement = _identity_placement(ifc, storey_placement)
+                _assign_shape(ifc, element, _tessellate(ifc, obj, unit_scale), body)
+                _run_api(
+                    ifcopenshell,
+                    "spatial.assign_container",
+                    ifc,
+                    "products",
+                    element,
+                    relating_structure=storey,
+                )
+                floor_count += 1
+
         self.report(
             {"INFO"},
             f"Created {wall_count} walls, {member_count} logs, "
-            f"{footing_count} footings. Save via Bonsai to write the IFC file.",
+            f"{footing_count} footings, {floor_count} floor parts. "
+            f"Save via Bonsai to write the IFC file.",
         )
         return {"FINISHED"}
 
@@ -1247,6 +2124,38 @@ class LOGCABIN_PT_panel(bpy.types.Panel):
         box.prop(props, "flatten_top")
         if props.flatten_top:
             box.prop(props, "top_flat_depth")
+
+        box = layout.box()
+        box.label(text="Floor", icon="MESH_GRID")
+        box.prop(props, "floor_type", expand=True)
+        if props.floor_type != "NONE":
+            box.prop(props, "joist_axis", expand=True)
+            if props.floor_type == "NOTCHED":
+                box.prop(props, "joist_diameter")
+                box.prop(props, "joist_overhang")
+                box.prop(props, "joist_flat_share")
+                box.prop(props, "log_beam_offset")
+                box.prop(props, "log_beam_spacing")
+                box.separator()
+                box.label(text="Beams across the logs", icon="MESH_CUBE")
+                box.prop(props, "joist_width")
+                box.prop(props, "joist_depth")
+                box.prop(props, "joist_spacing")
+                box.prop(props, "joist_wall_gap")
+            else:
+                box.prop(props, "joist_spacing")
+                box.prop(props, "joist_wall_gap")
+                box.prop(props, "joist_width")
+                box.prop(props, "joist_depth")
+                box.prop(props, "bracket_thickness")
+                box.prop(props, "bracket_mill")
+
+            box.separator()
+            box.prop(props, "add_deck")
+            if props.add_deck:
+                box.prop(props, "sheet_width")
+                box.prop(props, "sheet_length")
+                box.prop(props, "sheet_thickness")
 
         box = layout.box()
         box.label(text="Natural Variation", icon="RNDCURVE")
