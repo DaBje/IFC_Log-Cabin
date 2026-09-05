@@ -40,7 +40,7 @@ the floor - and never needs resampling.
 bl_info = {
     "name": "IFC Log Cabin",
     "author": "David Bjelland",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Log Cabin",
     "description": "Generate scribe-fit log cabins and export them as IFC via Bonsai",
@@ -119,6 +119,7 @@ class Log:
         self.groove = None
         self.notches = []
         self.flat_z = None
+        self.floor_z = None
 
     def axis_point(self, t):
         return self.p0.lerp(self.p1, t) + self.bow_vec * math.sin(math.pi * t)
@@ -194,6 +195,16 @@ def _ring_points(log, t, along, gap, n_up, n_low):
         top = math.sqrt(span) - drop
         if line_top is None or top > line_top:
             line_top = top
+
+    # A sill log is sawn flat where it beds on the foundation. That is the same
+    # shape as a notch - a horizontal cut - so it folds into line_top and needs
+    # no machinery of its own. It also cures the taper float: a round log on a
+    # flat foundation only touches where its radius is greatest, at the butt,
+    # whereas a sawn flat bears along the whole length.
+    if log.floor_z is not None:
+        flat = log.floor_z - centre.z
+        if line_top is None or flat > line_top:
+            line_top = flat
 
     # Lateral groove: the arc of the log below, offset down by a full round.
     groove = None
@@ -515,7 +526,15 @@ def generate_cabin(props):
     half_rise = round_rise / 2.0
 
     lines = collect_wall_lines(props)
-    base_z = r_butt  # first course rests on the pile tops
+
+    # With sawn sills the first course sits with its axis *on* the foundation,
+    # so its lower half is cut away and what remains is a half log bedded flat.
+    # The second course, half a round higher, still dips below the foundation
+    # and takes a shallower flat. That is what brings all four bottom logs down
+    # onto the piles instead of leaving the second course hanging in the air.
+    # Nothing above needs adjusting: only undersides are cut, and the courses
+    # above scribe onto tops.
+    base_z = 0.0 if props.sill_flat else r_butt
     max_courses = max(1, round(props.wall_height / half_rise))
 
     def course_z(course):
@@ -602,6 +621,12 @@ def generate_cabin(props):
                         radius_at(cross, course - 1, cross_index, line.position),
                     )
                 )
+
+            # The foundation plane is handed to every log as a floor. It only
+            # bites on the two bottom courses, whose undersides fall below it;
+            # higher up the log never reaches it and the cut never binds.
+            if props.sill_flat:
+                log.floor_z = 0.0
 
             # Top logs carry the roof, so they can be flattened to a level
             # bearing surface. Nothing sits on them to scribe against.
@@ -761,6 +786,16 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         description=(
             "Reverse every other log so a butt always beds onto a top. Keeps "
             "the wall rising level and the groove depth constant"
+        ),
+        default=True,
+    )
+    sill_flat: BoolProperty(
+        name="Sawn Sill Logs",
+        description=(
+            "Saw the bottom courses flat where they bed on the foundation. "
+            "The first course becomes a half log, the second a full log with a "
+            "shallower flat, so all four bottom logs bear on the piles along "
+            "their whole length instead of touching only at the butt"
         ),
         default=True,
     )
@@ -1208,6 +1243,7 @@ class LOGCABIN_PT_panel(bpy.types.Panel):
         box.prop(props, "scribe_depth")
         box.prop(props, "scribe_gap")
         box.prop(props, "alternate_butt")
+        box.prop(props, "sill_flat")
         box.prop(props, "flatten_top")
         if props.flatten_top:
             box.prop(props, "top_flat_depth")
