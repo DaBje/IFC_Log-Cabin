@@ -62,6 +62,11 @@ from bpy.props import (
 )
 from mathutils import Vector
 
+# How far a knot fades out before it reaches worked timber: a span of sweep in
+# radians, and a share of the radius below a sawn flat.
+_KNOT_FADE = 0.30
+_KNOT_FADE_FACE = 0.20
+
 COLLECTION_NAME = "Log Cabin"
 TYPE_KEY = "logcabin_type"
 WALL_KEY = "logcabin_wall"
@@ -99,7 +104,20 @@ class Log:
                 from above or below - a flat seat for a bracket
     """
 
-    def __init__(self, p0, p1, r_butt, r_top, rng, bow, radial_jitter, bow_vertical=0.25):
+    def __init__(
+        self,
+        p0,
+        p1,
+        r_butt,
+        r_top,
+        rng,
+        bow,
+        radial_jitter,
+        bow_vertical=0.25,
+        knot_density=0.0,
+        knot_size=0.06,
+        knot_rise=0.008,
+    ):
         self.p0 = Vector(p0)
         self.p1 = Vector(p1)
         self.r0 = r_butt
@@ -127,6 +145,27 @@ class Log:
         self.jitter_phase = rng.uniform(0.0, math.tau)
         self.jitter_freq = rng.uniform(1.5, 3.5)
 
+        # Knots: the swelling left where a branch grew out of the trunk.
+        # Unlike every other feature here they vary with angle as well as
+        # position along the log, so they are kept as centres and applied to
+        # the barrel rather than folded into the cross-section profile.
+        self.knots = []
+        expected = knot_density * self.length
+        whole = int(expected)
+        count = whole + (1 if rng.random() < expected - whole else 0)
+        for _ in range(count):
+            self.knots.append(
+                (
+                    rng.uniform(0.02, 0.98),
+                    rng.uniform(0.0, math.tau),
+                    # A knot of this size covers knot_size of length, and
+                    # subtends knot_size / radius around the log.
+                    rng.uniform(0.7, 1.4) * knot_size / max(self.length, 1e-6),
+                    rng.uniform(0.7, 1.4) * knot_size / max(r_butt, 1e-6),
+                    rng.uniform(0.5, 1.0) * knot_rise,
+                )
+            )
+
         self.groove = None
         self.notches = []
         self.flat_z = None
@@ -137,6 +176,25 @@ class Log:
 
     def axis_point(self, t):
         return self.p0.lerp(self.p1, t) + self.bow_vec * math.sin(math.pi * t)
+
+    def knot_offset(self, t, phi):
+        """How far the knots push the barrel out at this point on it.
+
+        Squared falloff in both directions, so a knot swells and dies away
+        smoothly rather than ending in a rim of its own.
+        """
+        rise = 0.0
+        for centre_t, centre_phi, spread_t, spread_phi, height in self.knots:
+            along = (t - centre_t) / spread_t
+            if along <= -1.0 or along >= 1.0:
+                continue
+            around = (phi - centre_phi + math.pi) % math.tau - math.pi
+            around /= spread_phi
+            if around <= -1.0 or around >= 1.0:
+                continue
+            fall = (1.0 - along * along) * (1.0 - around * around)
+            rise += height * fall * fall
+        return rise
 
     def radius(self, t):
         base = _lerp(self.r0, self.r1, t)
@@ -414,9 +472,27 @@ def _ring_points(log, t, along, gap, n_up, n_low):
 
     points = []
     for phi in _sweep_angles(phi0, phi0 + sweep, crown, n_up):
-        b = r * math.sin(phi)
+        rise = 0.0
+        if log.knots:
+            # Knots belong only on surfaces nobody has worked. Fade them out
+            # towards the shoulders and towards a sawn flat, so one can never
+            # land on a rim, a groove, a notch or a milled face - where a
+            # swelling would read as a defect in the cut rather than in the
+            # timber, and would break the creases those cuts depend on.
+            mask = min(
+                1.0, (min(phi - phi0, phi0 + sweep - phi)) / _KNOT_FADE
+            )
+            if ceiling is not None:
+                mask = min(
+                    mask, (ceiling - r * math.sin(phi)) / (r * _KNOT_FADE_FACE)
+                )
+            if mask > 0.0:
+                rise = log.knot_offset(t, phi) * min(1.0, mask)
+
+        radius = r + rise
+        b = radius * math.sin(phi)
         points.append(
-            (r * math.cos(phi), b if ceiling is None else min(b, ceiling))
+            (radius * math.cos(phi), b if ceiling is None else min(b, ceiling))
         )
     for a in _floor_samples(a_left, a_right, breaks, n_low):
         # a_rim already keeps the floor below the ceiling; the clamp is only a
@@ -434,6 +510,14 @@ def _station_params(log, axial, refine):
     """
     params = {round(i / axial, 6) for i in range(axial + 1)}
     if log.length > 1e-9:
+        # A knot is a few centimetres on a log several metres long, so the
+        # uniform stations will step straight over it. Each one gets its own.
+        for centre_t, _phi, spread_t, _spread_phi, _rise in log.knots:
+            for step in range(-3, 4):
+                param = centre_t + spread_t * step / 3.0
+                if 0.0 <= param <= 1.0:
+                    params.add(round(param, 6))
+
         for offset, _drop, radius, _cap in log.notches:
             # The notch floor is sqrt(R^2 - e^2), whose slope runs away at the
             # mouth. Sampling evenly along the log therefore spends stations
@@ -846,6 +930,9 @@ def generate_cabin(props):
                 props.bow,
                 props.radial_jitter,
                 props.bow_vertical,
+                props.knot_density,
+                props.knot_size,
+                props.knot_rise,
             )
 
             # Lateral groove, cut to the log two courses down on the same wall.
@@ -1064,6 +1151,9 @@ def generate_cabin(props):
                     props.bow,
                     props.radial_jitter,
                     props.bow_vertical,
+                    props.knot_density,
+                    props.knot_size,
+                    props.knot_rise,
                 )
                 log.flat_z = joist_flat
                 # The flat is full between the wall axes. Past them it runs
@@ -1651,6 +1741,30 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         max=0.4,
         precision=3,
     )
+    knot_density: FloatProperty(
+        name="Knots per Metre",
+        description=(
+            "How thickly knots are scattered along each log. 0 leaves the "
+            "timber clean. They appear only where nothing has been cut"
+        ),
+        default=0.6,
+        min=0.0,
+        max=8.0,
+    )
+    knot_size: FloatProperty(
+        name="Knot Size",
+        description="How far across the log's surface a knot spreads",
+        default=0.06,
+        min=0.005,
+        unit="LENGTH",
+    )
+    knot_rise: FloatProperty(
+        name="Knot Rise",
+        description="How far a knot stands proud of the barrel",
+        default=0.008,
+        min=0.0,
+        unit="LENGTH",
+    )
 
     # resolution
     axial_segments: IntProperty(
@@ -2163,6 +2277,10 @@ class LOGCABIN_PT_panel(bpy.types.Panel):
         box.prop(props, "bow")
         box.prop(props, "bow_vertical")
         box.prop(props, "radial_jitter")
+        box.prop(props, "knot_density")
+        if props.knot_density > 0.0:
+            box.prop(props, "knot_size")
+            box.prop(props, "knot_rise")
 
         box = layout.box()
         box.label(text="Internal Walls", icon="MOD_BUILD")
