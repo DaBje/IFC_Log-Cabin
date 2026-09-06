@@ -980,24 +980,61 @@ def generate_cabin(props):
             records.append((log, line.name, course))
             by_course.setdefault(course, []).append((log, line, wall_index))
 
-    # ---- floor structure -------------------------------------------------
-    # Joists span between two opposite sills. Which sills depends on their
-    # direction, and the two sill courses sit half a round apart, so the whole
-    # floor rides at whatever height its bearers are at.
+    # ---- floor and ceiling ------------------------------------------------
+    # The two are the same structure at different heights: members spanning
+    # between opposite wall courses in whichever style is chosen. Only the
+    # bearing course differs, and what sits around it - a floor is carried on
+    # piles and locked down by the wall course above, a ceiling has neither.
     joists = []
     boxes = []
     floor_piles = []
 
-    if props.floor_type != "NONE":
-        mean_r = pair / 2.0
-        along_y = props.joist_axis == "Y"
+    mean_r = pair / 2.0
+    along_y = props.joist_axis == "Y"
+    parity = 0 if along_y else 1  # the courses running across the joists
 
+    levels = []
+    if props.floor_type != "NONE":
+        levels.append(("Floor", parity, True, True, None))
+
+        # Bear the ceiling on the topmost course running the right way.
+        top_course = None
+        for course in range(max_courses - 1, -1, -1):
+            if course % 2 == parity and lines_at(course):
+                top_course = course
+                break
+        if props.add_ceiling and top_course is not None:
+            if props.floor_type == "NOTCHED":
+                # Drop the logs a round so the top wall course lands on top of
+                # them and can be notched over them - the same lock-in the
+                # floor logs get. It also buries the ceiling build-up within
+                # the wall instead of stacking it above the head.
+                ceiling_bearer = top_course - 2
+            else:
+                # Brackets hang off the wall head, so they bear on the top
+                # course itself.
+                ceiling_bearer = top_course
+
+            if ceiling_bearer > parity:
+                # Hung from a level worked out at the crown, so the deck over
+                # the joists finishes level with it.
+                sheet = props.sheet_thickness if props.add_deck else 0.0
+                crown = course_z(ceiling_bearer) + mean_r
+                levels.append(
+                    (
+                        "Ceiling",
+                        ceiling_bearer,
+                        False,
+                        True,
+                        crown - sheet - props.joist_depth,
+                    )
+                )
+
+    for prefix, bearer_course, add_piles, tie_above, hung_base in levels:
         if along_y:
-            bearer_course = 0  # the X walls
             span_end = props.width
             free_end = props.length
         else:
-            bearer_course = 1  # the Y walls
             span_end = props.length
             free_end = props.width
 
@@ -1111,6 +1148,7 @@ def generate_cabin(props):
         face = mean_r
 
         if props.floor_type == "NOTCHED":
+            level_beams = []  # this level's logs, for the tie-in below
             r_joist = props.joist_diameter / 2.0
             axis_z = sill_z + half_rise  # a course above its bearer, as a wall log would be
 
@@ -1192,25 +1230,27 @@ def generate_cabin(props):
                         drop = axis_z - member.axis_point(u).z
                         radius = member.radius(u)
                     log.notches.append((offset, drop, radius, None))
-                joists.append((log, f"Joist_{index + 1:02d}"))
+                joists.append((log, f"{prefix}_Log_{index + 1:02d}"))
+                level_beams.append(log)
 
-                # Piles under the joist, on the same grid as the perimeter, so
-                # no unsupported span exceeds Max Pile Span. The joist ends
-                # bear on the sills, which carry their own piles already.
-                segments = max(1, math.ceil(span_end / props.max_span))
-                for step in range(1, segments):
-                    coord = span_end * step / segments
-                    point = (pos, coord) if along_y else (coord, pos)
-                    floor_piles.append((round(point[0], 4), round(point[1], 4)))
+                # Piles under the log, on the same grid as the perimeter, so
+                # no unsupported span exceeds Max Pile Span. Its ends bear on
+                # the sills, which carry their own piles already. A ceiling
+                # has nothing to stand on, so it gets none.
+                if add_piles:
+                    segments = max(1, math.ceil(span_end / props.max_span))
+                    for step in range(1, segments):
+                        coord = span_end * step / segments
+                        spot = (pos, coord) if along_y else (coord, pos)
+                        floor_piles.append((round(spot[0], 4), round(spot[1], 4)))
 
             # The joists stand proud of the sills, so the wall course above has
             # to be notched over them - and that notch is what actually ties
             # the floor into the wall. The cut stops at the beam's sawn flat,
             # since there is no longer a full round up there to follow.
             joist_axis = "Y" if along_y else "X"
-            for log_above, line_above, index_above in by_course.get(
-                above_course, []
-            ):
+            tie_targets = by_course.get(above_course, []) if tie_above else []
+            for log_above, line_above, index_above in tie_targets:
                 if not 0.0 <= line_above.position <= span_end:
                     continue  # that wall does not pass over the joists
                 start_above, _end_above = ends(
@@ -1221,7 +1261,7 @@ def generate_cabin(props):
                 for joist_index, pos in enumerate(positions):
                     if not line_above.covers(pos):
                         continue
-                    beam = joists[joist_index][0]
+                    beam = level_beams[joist_index]
                     # Both sides measured on the real members, so the seating
                     # matches what the beam was actually cut to.
                     u = _param_along(log_above, line_above.axis, pos)
@@ -1260,7 +1300,7 @@ def generate_cabin(props):
                     seat - half_width, seat + half_width,
                     beam_base, beam_base + props.joist_depth,
                 )
-                add_box(f"Beam_{index + 1:02d}", lo, hi, "joist")
+                add_box(f"{prefix}_Beam_{index + 1:02d}", lo, hi, "joist")
 
             # Both layers are set out to the beams, even though the lower one
             # rests on the logs. Its seams then run directly under a beam,
@@ -1269,20 +1309,24 @@ def generate_cabin(props):
             deck_run = (cross_lo, cross_hi)
             deck_bays = (mean_r, span_end - mean_r)
             deck_layers = [
-                ("SheetUnder", not along_y, cross_at, deck_run, deck_bays,
-                 joist_flat, 1),
-                ("Sheet", not along_y, cross_at, deck_run, deck_bays,
-                 beam_base + props.joist_depth, 0),
+                (f"{prefix}_SheetUnder", not along_y, cross_at, deck_run,
+                 deck_bays, joist_flat, 1),
+                (f"{prefix}_Sheet", not along_y, cross_at, deck_run,
+                 deck_bays, beam_base + props.joist_depth, 0),
             ]
 
         else:  # BRACKET
             half_width = props.joist_width / 2.0
             plate = props.bracket_thickness
-            # A sheet goes on underneath as well, so the structure rides one
-            # sheet thickness up and that lower sheet finishes flush with the
-            # foundation top - which is also the underside of the lowest wall
-            # course.
-            underside = props.sheet_thickness if props.add_deck else 0.0
+            # A floor stands up off the foundation: a sheet goes on underneath
+            # too, so the structure rides one sheet thickness up and that lower
+            # sheet finishes flush with the foundation top, which is also the
+            # underside of the lowest wall course. A ceiling instead hangs from
+            # a level worked out at the wall head.
+            if hung_base is not None:
+                underside = hung_base
+            else:
+                underside = props.sheet_thickness if props.add_deck else 0.0
             joist_top = underside + props.joist_depth
 
             # Mill the inner face of the sills the brackets bear against, down
@@ -1355,7 +1399,9 @@ def generate_cabin(props):
                     pos + half_width,
                     point,
                 )
-                boxes.append((f"Joist_{index + 1:02d}", verts, faces, "joist"))
+                boxes.append(
+                    (f"{prefix}_Joist_{index + 1:02d}", verts, faces, "joist")
+                )
 
                 # One L-shaped bracket per end, rather than a seat and an
                 # upright meeting in mid air.
@@ -1381,7 +1427,7 @@ def generate_cabin(props):
                     )
                     boxes.append(
                         (
-                            f"Bracket_{index + 1:02d}{'AB'[side]}",
+                            f"{prefix}_Bracket_{index + 1:02d}{'AB'[side]}",
                             verts,
                             faces,
                             "bracket",
@@ -1393,10 +1439,10 @@ def generate_cabin(props):
             bracket_along = (face, span_end - face)
             bracket_across = (mean_r, free_end - mean_r)
             deck_layers = [
-                ("Sheet", along_y, positions, bracket_along, bracket_across,
-                 joist_top, 0),
-                ("SheetUnder", along_y, positions, bracket_along,
-                 bracket_across, 0.0, 1),
+                (f"{prefix}_Sheet", along_y, positions, bracket_along,
+                 bracket_across, joist_top, 0),
+                (f"{prefix}_SheetUnder", along_y, positions, bracket_along,
+                 bracket_across, underside - props.sheet_thickness, 1),
             ]
 
         # ---- plywood ---------------------------------------------------
@@ -1658,7 +1704,15 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
     )
     add_deck: BoolProperty(
         name="Plywood Deck",
-        description="Lay sheets over the floor structure, joints staggered",
+        description="Lay sheets over the structure, joints staggered",
+        default=True,
+    )
+    add_ceiling: BoolProperty(
+        name="Ceiling",
+        description=(
+            "Build the same structure again at the head of the walls, in "
+            "whichever style is selected above"
+        ),
         default=True,
     )
     sheet_width: FloatProperty(
@@ -2265,6 +2319,7 @@ class LOGCABIN_PT_panel(bpy.types.Panel):
                 box.prop(props, "bracket_mill")
 
             box.separator()
+            box.prop(props, "add_ceiling")
             box.prop(props, "add_deck")
             if props.add_deck:
                 box.prop(props, "sheet_width")
