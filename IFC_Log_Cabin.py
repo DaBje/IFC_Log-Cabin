@@ -3120,6 +3120,10 @@ def generate_cabin(props):
                                 )
                             )
 
+                # How far the outermost surface of the build-up stands off
+                # the roof plane at its edges - what the fascia has to reach.
+                outer = lift
+
                 if props.roof_covering in ("SHINGLES", "STONE"):
                     prefix = (
                         "Roof_Shingle"
@@ -3251,6 +3255,7 @@ def generate_cabin(props):
                                 off_lo = tile_offset(d_lo, row)
                                 off_top = tile_offset(d_top, row) + thick
                                 off_hi = tile_offset(d_hi, row)
+                                outer = max(outer, off_hi + thick)
                                 corners = [
                                     roof_point(start, d_lo, s) + normal * off_lo,
                                     roof_point(stop, d_lo, s) + normal * off_lo,
@@ -3295,6 +3300,7 @@ def generate_cabin(props):
                     # at the troughs, the one place this profile can't meet
                     # its mirror and stay a plain sheared cut both sides.
                     d_min_metal = -(lift + thick + depth) * math.tan(pitch)
+                    outer = lift + depth
                     for s, tag in ((-1.0, "A"), (1.0, "B")):
                         normal = roof_normal(s)
                         verts, faces = build_corrugated_slab(
@@ -3317,6 +3323,46 @@ def generate_cabin(props):
                         # Over the crests, which stand the corrugation depth
                         # proud of the panel's own plane.
                         lay_ridge_cap(lift + depth + 0.004, 0.0, False)
+
+                if props.add_fascia:
+                    # Boards standing square to the roof plane, closing the
+                    # gable-end edges of everything above the underside of
+                    # the deck. The eaves are left open on purpose - that is
+                    # where the air for the ventilated gap enters - and the
+                    # boards are mitred at the top on the vertical plane
+                    # through the ridge, the same cut the covering and the
+                    # cap use.
+                    ft = props.fascia_thickness
+                    ridge_reach = outer * math.tan(pitch)
+
+                    def fascia_board(s, name, a0, a1, d_bot, d_top, d_end):
+                        normal = roof_normal(s)
+                        lo = [
+                            roof_point(a0, d_bot, s),
+                            roof_point(a1, d_bot, s),
+                            roof_point(a1, d_end, s),
+                            roof_point(a0, d_end, s),
+                        ]
+                        hi = [
+                            roof_point(a0, d_top, s) + normal * outer,
+                            roof_point(a1, d_top, s) + normal * outer,
+                            roof_point(a1, d_end, s) + normal * outer,
+                            roof_point(a0, d_end, s) + normal * outer,
+                        ]
+                        verts, faces = build_slab_mesh(lo, normal, outer, hi)
+                        if s < 0:
+                            faces = [tuple(reversed(f)) for f in faces]
+                        boxes.append((name, verts, faces, "fascia"))
+
+                    for s, tag in ((-1.0, "A"), (1.0, "B")):
+                        fascia_board(
+                            s, f"Roof_Fascia_Barge_{tag}_1",
+                            along_lo - ft, along_lo, 0.0, -ridge_reach, d_max,
+                        )
+                        fascia_board(
+                            s, f"Roof_Fascia_Barge_{tag}_2",
+                            along_hi, along_hi + ft, 0.0, -ridge_reach, d_max,
+                        )
 
     piles = []
     if props.pile_height > 0.0:
@@ -3736,6 +3782,19 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
     )
     counter_batten_thickness: FloatProperty(
         name="Counter-Batten Thickness", default=0.02, min=0.01, unit="LENGTH"
+    )
+    add_fascia: BoolProperty(
+        name="Barge Boards",
+        description=(
+            "Close the gable-end edges of the whole build-up with a barge "
+            "board up each end, from the underside of the deck to the "
+            "outermost point of the covering. The eaves stay open so the "
+            "air gap can ventilate"
+        ),
+        default=True,
+    )
+    fascia_thickness: FloatProperty(
+        name="Barge Board Thickness", default=0.025, min=0.01, unit="LENGTH"
     )
     add_ridge_cap: BoolProperty(
         name="Ridge Cap",
@@ -4298,6 +4357,7 @@ class LOGCABIN_OT_to_ifc(bpy.types.Operator):
 
             elif kind in (
                 "joist", "bracket", "sheet", "purlin", "rafter", "lath", "covering",
+                "fascia",
             ):
                 if kind == "purlin":
                     element = ifcopenshell.api.run(
@@ -4333,7 +4393,7 @@ class LOGCABIN_OT_to_ifc(bpy.types.Operator):
                         predefined_type="SHEET",
                         name=obj.name,
                     )
-                elif kind == "lath":
+                elif kind in ("lath", "fascia"):
                     element = ifcopenshell.api.run(
                         "root.create_entity",
                         ifc,
@@ -4513,6 +4573,9 @@ class LOGCABIN_PT_panel(bpy.types.Panel):
                     box.prop(props, "covering_corrugation_pitch")
                     box.prop(props, "covering_corrugation_depth")
                     box.prop(props, "covering_metal_thickness")
+                box.prop(props, "add_fascia")
+                if props.add_fascia:
+                    box.prop(props, "fascia_thickness")
                 if props.roof_covering != "NONE":
                     box.prop(props, "add_ridge_cap")
                     if props.add_ridge_cap:
