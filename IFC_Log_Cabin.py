@@ -40,7 +40,7 @@ the floor - and never needs resampling.
 bl_info = {
     "name": "IFC Log Cabin",
     "author": "David Bjelland",
-    "version": (0, 4, 1),
+    "version": (0, 4, 2),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Log Cabin",
     "description": "Generate scribe-fit log cabins and export them as IFC via Bonsai",
@@ -583,7 +583,18 @@ def _ring_points(log, t, along, gap, n_up, layout):
     # Find where each tilt actually runs out, on whichever side it slopes
     # downhill towards, and pull the shoulder in to meet it.
     def _floor_edge(a):
-        return -math.sqrt(max(0.0, r * r - a * a))
+        # The floor a tilt has to clear is whatever is actually there - a
+        # notch's flat or a groove's crescent lifts it well above the bare
+        # barrel's underside, and a tilt that only cleared the barrel would
+        # leave that flat standing proud of the plane it is cutting to.
+        b = -math.sqrt(max(0.0, r * r - a * a))
+        if line_top is not None and line_top > b:
+            b = line_top
+        if groove is not None:
+            drop_f, r_groove_f = groove
+            if abs(a) < r_groove_f:
+                b = max(b, math.sqrt(r_groove_f * r_groove_f - a * a) - drop_f)
+        return b
 
     # A tilt's (slope, intercept) is measured against the *straight* axis,
     # the same as a plank's top and bottom are (see the note by log.plank
@@ -601,22 +612,53 @@ def _ring_points(log, t, along, gap, n_up, layout):
 
     for slope, intercept in log.tilt:
         intercept += slope * side_drift - up_drift
+
+        def room(a, slope=slope, intercept=intercept):
+            return slope * a + intercept - _floor_edge(a)
+
+        # Normally the tilt is still above the floor on the centre line and
+        # runs out somewhere further downhill. A notch's flat can lift the
+        # floor above the tilt even there - then it ran out uphill of the
+        # centre line, and the search has to start from the far shoulder
+        # instead, or the shoulder is left standing on the wrong side of it.
         if slope < 0.0:
-            lo, hi = 0.0, a_right
-            if slope * hi + intercept - _floor_edge(hi) < 0.0:
+            lo, hi = (0.0, a_right) if room(0.0) >= 0.0 else (a_left, 0.0)
+            if room(hi if lo == 0.0 else lo) < 0.0:
+                if lo == 0.0:
+                    for _ in range(48):
+                        mid = 0.5 * (lo + hi)
+                        if room(mid) >= 0.0:
+                            lo = mid
+                        else:
+                            hi = mid
+                    a_right = min(a_right, lo)
+                else:
+                    a_right = min(a_right, a_left)
+            elif lo != 0.0:
                 for _ in range(48):
                     mid = 0.5 * (lo + hi)
-                    if slope * mid + intercept - _floor_edge(mid) >= 0.0:
+                    if room(mid) >= 0.0:
                         lo = mid
                     else:
                         hi = mid
                 a_right = min(a_right, lo)
         elif slope > 0.0:
-            lo, hi = a_left, 0.0
-            if slope * lo + intercept - _floor_edge(lo) < 0.0:
+            lo, hi = (a_left, 0.0) if room(0.0) >= 0.0 else (0.0, a_right)
+            if room(lo if hi == 0.0 else hi) < 0.0:
+                if hi == 0.0:
+                    for _ in range(48):
+                        mid = 0.5 * (lo + hi)
+                        if room(mid) >= 0.0:
+                            hi = mid
+                        else:
+                            lo = mid
+                    a_left = max(a_left, hi)
+                else:
+                    a_left = max(a_left, a_right)
+            elif hi != 0.0:
                 for _ in range(48):
                     mid = 0.5 * (lo + hi)
-                    if slope * mid + intercept - _floor_edge(mid) >= 0.0:
+                    if room(mid) >= 0.0:
                         hi = mid
                     else:
                         lo = mid
@@ -1591,6 +1633,48 @@ def _frame_place(along_y):
     return place
 
 
+def _sheet_columns(lattice, lo, hi, width, avoid=()):
+    """Edges of the sheets across a run from lo to hi, each no wider than
+    `width` and every interior edge on one of the `lattice` positions - the
+    rafters - so a seam always has something to land on.
+
+    Fewest sheets first, then fewest edges shared with `avoid` (the
+    neighbouring row, so joints stagger). None narrower than half a sheet
+    where that can be avoided: a sliver at a gable end is what it prevents.
+    If no such run exists it falls back to an even split.
+    """
+    stops = [lo]
+    stops += sorted(
+        {round(x, 6) for x in lattice if lo + 1e-6 < x < hi - 1e-6}
+    )
+    stops.append(hi)
+    shared = {round(x, 6) for x in avoid}
+    for floor in (width * 0.5, width * 0.25, 0.0):
+        best = [None] * len(stops)  # (count, shared, previous)
+        best[0] = (0, 0, -1)
+        for j in range(1, len(stops)):
+            for i in range(j):
+                if best[i] is None:
+                    continue
+                w = stops[j] - stops[i]
+                if w > width + 1e-6 or w < floor - 1e-6:
+                    continue
+                cost = (
+                    best[i][0] + 1,
+                    best[i][1] + (1 if j < len(stops) - 1 and stops[j] in shared else 0),
+                )
+                if best[j] is None or cost < best[j][:2]:
+                    best[j] = (cost[0], cost[1], i)
+        if best[-1] is not None:
+            edges, j = [], len(stops) - 1
+            while j >= 0:
+                edges.append(stops[j])
+                j = best[j][2]
+            return edges[::-1]
+    count = max(1, math.ceil((hi - lo) / width - 1e-9))
+    return [lo + (hi - lo) * i / count for i in range(count + 1)]
+
+
 def _even_run(first, last, pitch):
     """Member centres from first to last inclusive, on pitch where it fits.
 
@@ -1827,12 +1911,61 @@ def generate_cabin(props):
             u = 0.0 if abs(span) < 1e-9 else (coord - p_start.y) / span
         return _lerp(r_butt, r_top, min(max(u, 0.0), 1.0))
 
+    # ---- roof plate --------------------------------------------------------
+    # The roof plane is fixed by the highest wall course of all, which is
+    # usually a gable one - so the highest log of the walls running the other
+    # way, under the eaves, can stop short of it, leaving a wedge of daylight
+    # under the deck all along the eave. Those walls are carried up by as many
+    # logs as it takes to reach the plane, and the top one is then cut off
+    # along it, the same way the gable logs are, so the deck beds on it.
+    plate_courses = {}  # course -> {wall index}, logs added above the walls
+    plate_cut = {}  # wall index -> (course, roof height at the wall)
+    plate_frame = None
+    if props.add_roof:
+        ridge_x0 = props.ridge_axis == "X"
+        span0 = props.width if ridge_x0 else props.length
+        gable_parity0 = 1 if ridge_x0 else 0
+        occupied0 = [c for c in range(max_courses) if lines_at(c)]
+        gable_top0 = max((c for c in occupied0 if c % 2 == gable_parity0), default=None)
+        if gable_top0 is not None and span0 > 2.0 * pair:
+            pitch0 = math.radians(props.roof_pitch)
+            half0 = span0 * 0.5
+            top0 = course_z(max(occupied0)) + pair / 2.0
+            plate_frame = (ridge_x0, half0, top0, math.tan(pitch0))
+
+            def plane_z(across):
+                return top0 + (half0 - abs(across - half0)) * math.tan(pitch0)
+
+            for wall_index in (0, 1) if ridge_x0 else (2, 3):
+                line = lines[wall_index]
+                own = [c for c in range(max_courses) if line.parity == c % 2 and
+                       course_z(c) + pair / 2.0 <= line.height + 1e-6]
+                if not own:
+                    continue
+                top_course = max(own)
+                reach = plane_z(line.position)
+                # The log is worth cutting once the plane passes through its
+                # section at all - closer than a radius, measured square to it.
+                while (reach - course_z(top_course)) * math.cos(pitch0) >= pair / 2.0:
+                    top_course += 2
+                    plate_courses.setdefault(top_course, set()).add(wall_index)
+                plate_cut[wall_index] = (top_course, reach)
+
+    def carried(course):
+        """Lines with a log at this course, the roof plate ones included."""
+        found = list(lines_at(course))
+        found += [(i, lines[i]) for i in sorted(plate_courses.get(course, ()))]
+        return found
+
+    total_courses = max([max_courses] + [c + 1 for c in plate_courses])
+
     records = []
     by_course = {}  # course -> [(log, line, wall_index)], for tying the floor in
-    for course in range(max_courses):
-        below = lines_at(course - 1)
-        two_below = {index for index, _line in lines_at(course - 2)}
-        above = {index for index, _line in lines_at(course + 2)}
+    plate_logs = {}  # course -> [(log, line, wall_index)]
+    for course in range(total_courses):
+        below = carried(course - 1)
+        two_below = {index for index, _line in carried(course - 2)}
+        above = {index for index, _line in carried(course + 2)}
 
         # The real logs one and two courses down, so the groove and the
         # saddle notches can be cut to the surfaces that are actually there.
@@ -1845,13 +1978,17 @@ def generate_cabin(props):
         # already built by the time we get here, since courses are processed
         # in order and this reads only courses already finished.
         below_logs = {
-            index: member for member, _line, index in by_course.get(course - 1, [])
+            index: member
+            for member, _line, index in by_course.get(course - 1, [])
+            + plate_logs.get(course - 1, [])
         }
         two_below_logs = {
-            index: member for member, _line, index in by_course.get(course - 2, [])
+            index: member
+            for member, _line, index in by_course.get(course - 2, [])
+            + plate_logs.get(course - 2, [])
         }
 
-        for wall_index, line in lines_at(course):
+        for wall_index, line in carried(course):
             p_start, p_end = ends(line, course, wall_index)
             log = Log(
                 p_start,
@@ -1927,13 +2064,36 @@ def generate_cabin(props):
             if props.sill_flat:
                 log.floor_z = 0.0
 
+            # The top log under an eave is cut off along the roof plane. slope
+            # is d(plane height)/d(a) for this log's own side vector, and the
+            # intercept is the plane's height over the wall axis above where
+            # this log's axis sits.
+            top_log_here = (
+                plate_frame is not None
+                and wall_index in plate_cut
+                and plate_cut[wall_index][0] == course
+                and (plate_cut[wall_index][1] - course_z(course)) * math.cos(
+                    math.atan(plate_frame[3])
+                ) < pair / 2.0
+            )
+            if top_log_here:
+                ridge_x1, half1, _top1, tan1 = plate_frame
+                side_c = log.side.y if ridge_x1 else log.side.x
+                sign = 1.0 if line.position < half1 else -1.0
+                log.tilt = [
+                    (sign * tan1 * side_c, plate_cut[wall_index][1] - course_z(course))
+                ]
+
             # Top logs carry the roof, so they can be flattened to a level
             # bearing surface. Nothing sits on them to scribe against.
-            if props.flatten_top and wall_index not in above:
+            if props.flatten_top and wall_index not in above and not log.tilt:
                 log.flat_z = course_z(course) + pair / 2.0 - props.top_flat_depth
 
             records.append((log, line.name, course))
-            by_course.setdefault(course, []).append((log, line, wall_index))
+            if course in plate_courses and wall_index in plate_courses[course]:
+                plate_logs.setdefault(course, []).append((log, line, wall_index))
+            else:
+                by_course.setdefault(course, []).append((log, line, wall_index))
 
     # ---- floor and ceiling ------------------------------------------------
     # The two are the same structure at different heights: members spanning
@@ -2568,6 +2728,27 @@ def generate_cabin(props):
                         taper(p0.y if ridge_x else p0.x),
                         taper(p1.y if ridge_x else p1.x),
                     )
+                    # Where the roof plate under the eave crosses this log's
+                    # underside, it takes the same saddle notch any crossing
+                    # log does.
+                    for plate_member, plate_line, _plate_index in plate_logs.get(
+                        course - 1, []
+                    ):
+                        across_here = p0.y if ridge_x else p0.x
+                        offset = (plate_line.position - across_here) * (
+                            log.dir.y if ridge_x else log.dir.x
+                        )
+                        if offset < -r_butt or offset > log.length + r_butt:
+                            continue
+                        u = _param_along(plate_member, plate_line.axis, line.position)
+                        log.notches.append(
+                            (
+                                offset,
+                                z - plate_member.axis_point(u).z,
+                                plate_member.radius(u),
+                                None,
+                            )
+                        )
                     below[index] = (near, far, flip)
                     gable_members.append((log, index, near, far))
                     records.append((log, f"Wall_Gable_{'AB'[side]}", course))
@@ -2755,7 +2936,28 @@ def generate_cabin(props):
             # sits closest, so seams land on something rather than floating -
             # just worked out on the roof plane's own tilted frame instead of
             # a level one.
-            if props.add_roof_deck:
+            # The rafters' own centres - laid out here, ahead of the deck
+            # below them, because the sheets' seams follow them.
+            r_rafter = props.rafter_diameter * 0.5
+            rafter_lattice = _even_run(
+                along_lo + r_rafter, along_hi - r_rafter, props.rafter_spacing
+            )
+
+            # (Laid out when either sheet layer needs it - the second one
+            # sits on the rafters and does not depend on the deck below.)
+            if props.add_roof_deck or (props.add_rafters and props.add_roof_sheathing2):
+                # Sheets run with their long side down the slope and their
+                # width across it, so that width - a whole number of rafter
+                # bays - is what the seams between neighbours follow.
+                # Neighbouring rows take two different layouts so the joints
+                # stagger, and neither leaves a sliver at a gable end.
+                columns_even = _sheet_columns(
+                    rafter_lattice, along_lo, along_hi, props.sheet_width
+                )
+                columns_odd = _sheet_columns(
+                    rafter_lattice, along_lo, along_hi, props.sheet_width,
+                    avoid=columns_even[1:-1],
+                )
                 # The ridge log's own crown sits exactly on the true peak,
                 # where both roof planes meet, but its flat cut face - what a
                 # sheet actually beds onto - runs on from there out to its own
@@ -2781,7 +2983,7 @@ def generate_cabin(props):
                     # to the centre of the ridge's own cut face - too narrow
                     # to be a sheet in its own right, but real coverage, not
                     # a seam. Every row after that steps to the next carrier
-                    # inside reach of a sheet width rather than a fixed step,
+                    # inside reach of a sheet length rather than a fixed step,
                     # the same rule the floor uses, so a seam lands on a
                     # purlin wherever one is close enough, and falls back to
                     # a floating seam only where none is.
@@ -2795,30 +2997,27 @@ def generate_cabin(props):
                     # what it laps.
                     bounds = [d_min - lap, d_ridge_cut]
                     for _ in range(len(carriers) + 2):
-                        if d_max - bounds[-1] <= wide + 1e-6:
+                        if d_max - bounds[-1] <= long + 1e-6:
                             break
                         nxt = None
                         for centre in carriers:
                             if centre <= bounds[-1] + 1e-6:
                                 continue
-                            if centre - bounds[-1] > wide + 1e-6:
+                            if centre - bounds[-1] > long + 1e-6:
                                 break
                             nxt = centre
-                        bounds.append(bounds[-1] + wide if nxt is None else nxt)
+                        bounds.append(bounds[-1] + long if nxt is None else nxt)
                     bounds.append(d_max)
 
                     for row, (d_a, d_b) in enumerate(zip(bounds, bounds[1:])):
                         if d_b - d_a <= 1e-6:
                             continue
-                        cursor = along_lo - (row % 2) * long * 0.5
-                        column = 0
-                        while cursor < along_hi - 1e-6:
-                            start = max(cursor, along_lo)
-                            stop = min(cursor + long, along_hi)
-                            cursor += long
+                        edges = columns_even if row % 2 == 0 else columns_odd
+                        for column, (start, stop) in enumerate(
+                            zip(edges, edges[1:]), start=1
+                        ):
                             if stop - start <= 1e-6:
                                 continue
-                            column += 1
                             corners = [
                                 roof_point(start, d_a, s) + normal * lift,
                                 roof_point(stop, d_a, s) + normal * lift,
@@ -2837,16 +3036,17 @@ def generate_cabin(props):
                                 )
                             )
 
-                for s, tag in ((-1.0, "A"), (1.0, "B")):
-                    carriers = sorted(
-                        {
-                            abs(across - half) / cos_p
-                            for across, _diameter, _name in members
-                            if (across - half) * s >= -1e-9
-                        }
-                    )
-                    lap = props.sheet_thickness if tag == "B" else 0.0
-                    lay_roof_sheets(f"RoofDeck_{tag}", s, carriers, lap)
+                if props.add_roof_deck:
+                    for s, tag in ((-1.0, "A"), (1.0, "B")):
+                        carriers = sorted(
+                            {
+                                abs(across - half) / cos_p
+                                for across, _diameter, _name in members
+                                if (across - half) * s >= -1e-9
+                            }
+                        )
+                        lap = props.sheet_thickness if tag == "B" else 0.0
+                        lay_roof_sheets(f"RoofDeck_{tag}", s, carriers, lap)
 
             # Rafters on top of the deck, running down the slope. Spaced the
             # same way the floor's joists are - the outermost pair flush
@@ -2857,8 +3057,6 @@ def generate_cabin(props):
             # side the deck's own sheets are not, so the two layers break
             # joint rather than doubling up on the same side.
             if props.add_rafters:
-                r_rafter = props.rafter_diameter * 0.5
-
                 def rafter_rise(s):
                     return roof_normal(s) * (
                         props.sheet_thickness + props.rafter_height * 0.5
@@ -2869,9 +3067,7 @@ def generate_cabin(props):
                 # from along_lo/along_hi, or its round side runs on past
                 # where the purlins, ridge and deck - all referenced by
                 # their own tips there - actually end.
-                positions = _even_run(
-                    along_lo + r_rafter, along_hi - r_rafter, props.rafter_spacing
-                )
+                positions = rafter_lattice
                 rafters = {}  # (index, tag) -> Log, for the noggins below
                 for index, along in enumerate(positions):
                     for s, tag in ((-1.0, "A"), (1.0, "B")):
