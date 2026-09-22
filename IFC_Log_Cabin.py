@@ -40,7 +40,7 @@ the floor - and never needs resampling.
 bl_info = {
     "name": "IFC Log Cabin",
     "author": "David Bjelland",
-    "version": (0, 4, 2),
+    "version": (0, 4, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Log Cabin",
     "description": "Generate scribe-fit log cabins and export them as IFC via Bonsai",
@@ -267,6 +267,14 @@ _CLEAR = 5e-4
 # back on itself and cannot be stitched into a closed shell.
 _TIP = 2e-4
 
+# How far past its own mouth a seat runs out, as a share of the radius it is
+# cut to. A seat that simply stopped would leave its cut face at full width
+# in one section and gone in the next, which pops every vertex on that face
+# across to the crown at once and creases the band between them. Easing the
+# cut back into the barrel instead closes the face over several sections, the
+# way a chisel leaves the mouth of a real seat flared rather than square.
+_SEAT_RELIEF = 0.18
+
 
 def _floor_layout(log, n_up):
     """Vertex slots per half of the floor, as (barrel, flat, groove) counts.
@@ -458,12 +466,22 @@ def _ring_points(log, t, along, gap, n_up, layout):
     # and the cut runs from the slab's underside upward because a log has to
     # be laid into an open seat rather than threaded through a hole.
     for offset, radius, axis_z in log.pockets:
-        reach = along - offset
-        span = radius * radius - reach * reach
-        if span <= 0.0:
+        reach = abs(along - offset)
+        relief = radius * _SEAT_RELIEF
+        if reach >= radius + relief:
             continue  # this station clears the crossing
-        local = axis_z - math.sqrt(span) - centre.z
-        if local < r:
+        mouth = axis_z - centre.z  # the seat's own top, level with that axis
+        if reach <= radius:
+            local = mouth - math.sqrt(radius * radius - reach * reach)
+        else:
+            # Past the mouth the seat runs out into the barrel, meeting it
+            # flush so the cut face closes rather than vanishing outright.
+            away = (radius + relief - reach) / relief
+            local = mouth + (r - mouth) * math.sqrt(max(0.0, 1.0 - away * away))
+        # Right at the end of the run-out the cut face is down to a hair.
+        # Left in, it is a strip of near-zero width, the same sliver the
+        # floor's own segments are snapped shut rather than carry.
+        if local < r and math.sqrt(max(0.0, r * r - local * local)) > _SNAP:
             ceiling = local if ceiling is None else min(ceiling, local)
 
     # Saddle notches. A perpendicular log removes a horizontal slab, so its
@@ -690,16 +708,27 @@ def _ring_points(log, t, along, gap, n_up, layout):
                 mask = min(mask, (ceiling - b) / (r * _KNOT_FADE_FACE))
             if mask > 0.0:
                 rise = log.knot_offset(t, phi) * min(1.0, mask)
-        if rise:
+        # A chiselled pad truncates the section sideways; slots past it are
+        # pinned to its face. Tested on the outline itself, before any knot
+        # swells it - a knot pushes the barrel out past +/-half, and read as
+        # material standing proud of a pad it drops the slot to upper(half),
+        # the log's equator, folding the barrel over the knot.
+        pinned = False
+        if a > a_right:
+            a, b = a_right, min(b, upper(a_right))
+            pinned = True
+        elif a < a_left:
+            a, b = a_left, min(b, upper(a_left))
+            pinned = True
+        if rise and not pinned:
             a, b = a + rise * math.cos(phi), b + rise * math.sin(phi)
             if ceiling is not None:
                 b = min(b, ceiling)
-        # A chiselled pad truncates the section sideways; slots past it are
-        # pinned to its face.
-        if a > a_right:
-            a, b = a_right, min(b, upper(a_right))
-        elif a < a_left:
-            a, b = a_left, min(b, upper(a_left))
+            # Only a genuine cut face limits the swelling, and only sideways.
+            if a_right < half:
+                a = min(a, a_right)
+            if a_left > -half:
+                a = max(a, a_left)
         # A tilt plane only ever trims the top: it is a straight line with no
         # curvature, so past the shoulder it keeps descending long after the
         # barrel has curved back up to meet the floor, and applying it there
@@ -877,8 +906,14 @@ def _ring_points(log, t, along, gap, n_up, layout):
 
     # Which crease slots are live creases at this station: the rim wherever
     # anything cuts the underside, the edge only while notch and groove are
-    # both actually showing.
-    return points, (rim > 0.0, 0.0 < edge < rim), web
+    # both actually showing, and the top's own rim wherever anything cuts
+    # the crown - a seat's mouth grazes the barrel so shallowly that an angle
+    # test drops it, which is exactly where the shading then smears.
+    return (
+        points,
+        (rim > 0.0, 0.0 < edge < rim, ceiling is not None and -r < ceiling < r),
+        web,
+    )
 
 
 def _rake_ends(log, gap, n_up):
@@ -1001,19 +1036,71 @@ def _station_params(log, axial, refine, gap=0.0, n_up=15):
                         if 0.0 <= param <= 1.0:
                             params.add(round(param, 6))
 
-        # A seat curves like the member it receives, so it is sampled by the
-        # crossing angle for the same reason a notch is: that gathers stations
-        # at the mouth, where sqrt(R^2 - e^2) turns hardest.
-        for offset, radius, _axis_z in log.pockets:
+        # A seat curves like the member it receives. Sampled by the crossing
+        # angle, the stations spread evenly around that curve - which leaves
+        # the stretch nearest the mouth, where the seat's wall has turned
+        # nearly vertical along the log, crossed in a single long step, and
+        # the band across it crumples. Stepping by the depth the seat cuts to
+        # instead puts the stations where that depth is actually moving, so
+        # the wall at the mouth is built out of short bands rather than one
+        # slanted one.
+        for offset, radius, axis_z in log.pockets:
             for k in range(refine + 1):
-                psi = math.pi * (k / refine - 0.5)
-                param = (offset + radius * math.sin(psi)) / log.length
-                if 0.0 <= param <= 1.0:
-                    params.add(round(param, 6))
-            for edge, outward in ((offset - radius, -1.0), (offset + radius, 1.0)):
-                param = (edge + outward * 0.004) / log.length
-                if 0.0 <= param <= 1.0:
-                    params.add(round(param, 6))
+                rise = radius * k / refine
+                edge = math.sqrt(max(0.0, radius * radius - rise * rise))
+                for param in (
+                    (offset - edge) / log.length,
+                    (offset + edge) / log.length,
+                ):
+                    if 0.0 <= param <= 1.0:
+                        params.add(round(param, 6))
+
+            # Wherever the seat first bites, it meets the barrel along it -
+            # the two curves touch rather than cross - and the cut face
+            # springs open from nothing like a square root, too fast for any
+            # stepping of the seat's own shape to follow. Solving instead for
+            # where the face reaches a given width puts a station on each,
+            # which is what opens it evenly.
+            share = min(max(offset / log.length, 0.0), 1.0)
+            r_here = log.radius(share)
+            mouth = axis_z - log.axis_point(share).z
+            # Twice the usual count: only the part of this range the seat
+            # actually reaches lands on the log at all, and it is the one
+            # place the face's width is the thing that has to be followed.
+            steps = 2 * refine
+            for k in range(steps + 1):
+                wide = r_here * k / steps
+                deep = mouth - math.sqrt(max(0.0, r_here * r_here - wide * wide))
+                if not 0.0 <= deep <= radius:
+                    continue
+                edge = math.sqrt(max(0.0, radius * radius - deep * deep))
+                for param in (
+                    (offset - edge) / log.length,
+                    (offset + edge) / log.length,
+                ):
+                    if 0.0 <= param <= 1.0:
+                        params.add(round(param, 6))
+            # And across the run-out past each mouth, by the same rule: step
+            # the width the face still has, and solve back for where that
+            # leaves the station. The run-out leaves the mouth almost
+            # vertically and arrives flush with the barrel, so neither its
+            # length nor its depth steps evenly - the face's own width does.
+            relief = radius * _SEAT_RELIEF
+            span = r_here - mouth
+            if abs(span) > 1e-9:
+                for k in range(refine + 1):
+                    wide = math.sqrt(max(0.0, r_here * r_here - mouth * mouth)) * (
+                        1.0 - k / refine
+                    )
+                    deep = math.sqrt(max(0.0, r_here * r_here - wide * wide))
+                    away = 1.0 - ((deep - mouth) / span) ** 2
+                    edge = radius + relief * (1.0 - math.sqrt(max(0.0, away)))
+                    for param in (
+                        (offset - edge) / log.length,
+                        (offset + edge) / log.length,
+                    ):
+                        if 0.0 <= param <= 1.0:
+                            params.add(round(param, 6))
 
         # A knot is a few centimetres on a log several metres long, so the
         # uniform stations will step straight over it. Each one gets its own.
@@ -1249,6 +1336,10 @@ def build_log_mesh(log, axial, radial, gap, refine, creases=None):
             if flat_n and groove_n
             else ()
         )
+        # Where the barrel over the top hands over to whatever is cut across
+        # it. The face's own two ends are that hand-over: the barrel slots
+        # above them have already closed onto the same points.
+        top_rim_slots = (top_barrel, top_barrel + top_face - 1)
 
         def slot_id(station, slot):
             whole, right, left = station
@@ -1259,7 +1350,11 @@ def build_log_mesh(log, axial, radial, gap, refine, creases=None):
             return left[left_slots.index(slot)]
 
         for i, (low, high) in enumerate(pairs):
-            for kind, slots in ((0, rim_slots), (1, edge_slots)):
+            for kind, slots in (
+                (0, rim_slots),
+                (1, edge_slots),
+                (2, top_rim_slots),
+            ):
                 if not (flags[i][kind] and flags[i + 1][kind]):
                     continue
                 for slot in slots:
@@ -1393,13 +1488,35 @@ def _cope_cap(verts, faces, log, loop, outward, target):
         else:
             faces.append((pushed[j], loop[j], loop[j_next], pushed[j_next]))
 
-    total = Vector((0.0, 0.0, 0.0))
-    for v in pushed:
-        total += verts[v]
+    # The pushed ring lies on the target's curved surface, so a flat fan from
+    # its average would sag under that surface - the average of points on a
+    # curve is inside it - and read as a dimple. Fill it instead with rings
+    # shrunk in towards the centre, each pushed onto the surface the same way,
+    # so the cap follows the curve all the way in.
+    centre = Vector((0.0, 0.0, 0.0))
+    for idx in loop:
+        centre += verts[idx]
+    centre = centre / count
+
+    rings = [pushed]
+    for share in (2.0 / 3.0, 1.0 / 3.0):
+        ring = []
+        for idx in loop:
+            point = centre + (verts[idx] - centre) * share
+            ring.append(len(verts))
+            verts.append(_cope_push(point, dir_, target, outward))
+        rings.append(ring)
+
+    for outer, inner in zip(rings, rings[1:]):
+        for j in range(count):
+            j_next = (j + 1) % count
+            quad = (inner[j], outer[j], outer[j_next], inner[j_next])
+            faces.append(quad if outward else tuple(reversed(quad)))
+
     centre_index = len(verts)
-    verts.append(total / count)
+    verts.append(_cope_push(centre, dir_, target, outward))
     for j in range(count):
-        here, after = pushed[j], pushed[(j + 1) % count]
+        here, after = rings[-1][j], rings[-1][(j + 1) % count]
         if outward:
             faces.append((centre_index, here, after))
         else:
@@ -2755,6 +2872,111 @@ def generate_cabin(props):
 
                 course += 2
 
+            # Near the peak the courses run out - a log has to be at least a
+            # log's worth long to notch onto the one below - but the wedge of
+            # wall between the last one, the ridge beam and the roof plane is
+            # still open, showing daylight either side of the beam. Fill it
+            # with a short piece of log on each side of the beam instead: the
+            # same course rhythm, grooved onto the log below, cut off in the
+            # roof plane at its outer end like any gable log, and scribed to
+            # the beam at its inner end. That has to wait for the beam itself,
+            # below: it bows and varies in thickness, and at the gable it sits
+            # up to a few millimetres off where a straight one would, which
+            # shows as a gap on one side and a clash on the other.
+            first_open_course = course
+
+            def add_ridge_pieces(ridge_beam):
+                piece_course = first_open_course
+                while True:
+                    z = course_z(piece_course)
+                    if z - r_butt >= ridge_z:
+                        break  # entirely above the peak - nothing left to fill
+                    cut = (z - wall_top) * per_rise
+                    # Where the beam actually is at this gable, and how thick.
+                    for side, index in enumerate(gable_lines):
+                        line = lines[index]
+                        where = _param_along(
+                            ridge_beam, "X" if ridge_x else "Y", line.position
+                        )
+                        centre = ridge_beam.axis_point(where)
+                        tangent = (
+                            (ridge_beam.p1 - ridge_beam.p0)
+                            + ridge_beam.bow_vec * math.pi * math.cos(math.pi * where)
+                        ).normalized()
+                        reach_beam = ridge_beam.radius(where) + props.scribe_gap
+                        across_beam = centre.y if ridge_x else centre.x
+                        # The unscribed end starts a hair short of the beam's
+                        # widest point, so every point of it has a crossing
+                        # ahead of it to be pushed out to - one starting
+                        # exactly on the surface can round to just past it and
+                        # be sent to the far side of the beam instead.
+                        # A bowed beam runs at a slight angle to the wall, so
+                        # across the piece's own width its surface is nearer
+                        # on one side than at the middle - allow for that too.
+                        lean = tangent.y if ridge_x else tangent.x
+                        standoff = reach_beam + 0.003 + 0.15 * abs(lean)
+                        left_end = across_beam - standoff
+                        if left_end - (cut - out_butt) < 0.03:
+                            return
+
+                        low_b, high_b, flip_b = below[index]
+                        start, stop = (high_b, low_b) if flip_b else (low_b, high_b)
+                        run = stop - start
+
+                        def taper(coord, start=start, run=run):
+                            share = 0.0 if abs(run) < 1e-9 else (coord - start) / run
+                            return _lerp(r_butt, r_top, min(max(share, 0.0), 1.0))
+
+                        # One piece each side of the beam, butt on the outside.
+                        for outer, inner, reach in (
+                            (cut - out_butt, left_end, (cut - out_butt, left_end)),
+                            (
+                                slope_span - cut + out_butt,
+                                across_beam + standoff,
+                                (across_beam + standoff, slope_span - cut + out_butt),
+                            ),
+                        ):
+                            if ridge_x:
+                                p0 = Vector((line.position, outer, z))
+                                p1 = Vector((line.position, inner, z))
+                            else:
+                                p0 = Vector((outer, line.position, z))
+                                p1 = Vector((inner, line.position, z))
+                            # A piece this short is no log of its own: the
+                            # taper and thickness wobble a real log spreads
+                            # over metres would be squeezed into a few
+                            # centimetres and read as a lumpy cone. It takes
+                            # the size the wall's logs have here instead,
+                            # held constant, with no bow or knots.
+                            r_here = taper(
+                                0.5 * (p0.y + p1.y) if ridge_x else 0.5 * (p0.x + p1.x)
+                            )
+                            log = Log(
+                                p0, p1, r_here, r_here, rng,
+                                0.0, 0.0, props.bow_vertical,
+                                0.0, props.knot_size, props.knot_rise,
+                            )
+                            # Same correction as the full logs: stretch the
+                            # raked end by what its own radius really is, so
+                            # it closes exactly in the roof plane. Only the
+                            # outer end is raked; the far ramp is set out of
+                            # reach.
+                            stretch = (log.radius(0.0) - r_butt) * per_rise
+                            log.p0 = log.p0 - log.dir * stretch
+                            log.length = (log.p1 - log.p0).length
+                            log.rake = (rake[0], log.radius(0.0), -1000.0)
+                            log.groove = (
+                                round_rise,
+                                taper(log.p0.y if ridge_x else log.p0.x),
+                                taper(log.p1.y if ridge_x else log.p1.x),
+                            )
+                            log.cope1 = (centre, tangent, reach_beam)
+                            gable_members.append((log, index, reach[0], reach[1]))
+                            records.append(
+                                (log, f"Wall_Gable_{'AB'[side]}", piece_course)
+                            )
+                    piece_course += 2
+
             # Ridge, then purlins stepping down the rafter line from it. Each
             # sits with its crown on the roof plane, so rafters would bear on
             # all of them evenly.
@@ -2778,18 +3000,36 @@ def generate_cabin(props):
             gable_axis = "Y" if ridge_x else "X"
 
             def resting_course(across_pos, ceiling_z):
-                """The topmost gable course, at or below ceiling_z, whose span
-                reaches across_pos - the log a member here would actually bear
-                on. None where nothing does, which happens near the peak once
-                the gable courses have run out."""
+                """Where the topmost gable course at or below ceiling_z, whose
+                span reaches across_pos, actually presents its surface - the
+                log a member here would bear on, and the height its own top
+                really is there: its barrel crown, or lower where its rake has
+                already cut into it near its own end. None where nothing
+                bears, which happens near the peak once the courses have run
+                out."""
                 best = None
                 for member, _index, low, high in gable_members:
                     if not low - 1e-6 <= across_pos <= high + 1e-6:
                         continue
                     where = _param_along(member, gable_axis, across_pos)
                     axis = member.axis_point(where).z
-                    if axis <= ceiling_z and (best is None or axis > best[0]):
-                        best = (axis, member.radius(where))
+                    if axis > ceiling_z or (best is not None and axis <= best[0]):
+                        continue
+                    crown = member.radius(where)
+                    if member.rake is not None:
+                        slope, drop_start, drop_end = member.rake
+                        span_here = where * member.length
+                        crown = min(
+                            crown,
+                            min(
+                                member.p0.z - drop_start + span_here * slope,
+                                member.p0.z
+                                - drop_end
+                                + (member.length - span_here) * slope,
+                            )
+                            - axis,
+                        )
+                    best = (axis, axis + crown)
                 return best
 
             for across, diameter, name in members:
@@ -2797,19 +3037,29 @@ def generate_cabin(props):
                 roof_z = ridge_z - abs(across - half) * math.tan(pitch) - radius
                 z = roof_z
 
-                # Nest into the top half of whichever course this member is
-                # actually resting on, rather than trusting the continuous
+                # Bed the axis on the surface of whichever course this member
+                # actually rests on, rather than trusting the continuous
                 # roof-plane formula to land it there by itself. Gable courses
                 # step by half_rise while the roof plane is continuous, so
                 # left alone a member can end up low against a course - close
                 # to daylight at the step above it - or, near the peak where
                 # the last course is a sliver, floating clear of any gable
-                # material at all. Only ever raised, never lowered: the crown
-                # stays on or above the roof plane, never below it.
+                # material at all.
+                #
+                # The axis, not some fraction of the way up to it: the seat
+                # cut below is a channel open to the sky, cut down to the
+                # member's own underside, so burying the axis leaves the
+                # channel's walls standing above the member with nothing in
+                # them - the sliver of daylight beside a purlin. Sat on the
+                # surface instead, the member is let in by half its round and
+                # fills what was cut for it. The crown is still cut to the
+                # roof plane, so what this changes is how much of the round
+                # survives below that cut, never where the top face sits.
+                # Only ever raised, never lowered.
                 rest = resting_course(across, z + radius)
                 if rest is not None:
-                    rest_axis, rest_radius = rest
-                    z = max(z, rest_axis + rest_radius * 0.45)
+                    _rest_axis, rest_surface = rest
+                    z = max(z, rest_surface)
 
                 if ridge_x:
                     p0 = Vector((-props.overhang, across, z))
@@ -2850,6 +3100,8 @@ def generate_cabin(props):
                 else:
                     sign = 1.0 if across > half else -1.0
                     beam.tilt = [(downhill * sign, crown_b)]
+                if name == "Ridge":
+                    add_ridge_pieces(beam)
 
                 # The gable is worked to receive the purlin, never the other
                 # way round - it is the wall that gets cut, as the reference
