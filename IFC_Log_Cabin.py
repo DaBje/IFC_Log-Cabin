@@ -40,7 +40,7 @@ the floor - and never needs resampling.
 bl_info = {
     "name": "IFC Log Cabin",
     "author": "David Bjelland",
-    "version": (0, 4, 3),
+    "version": (0, 4, 4),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Log Cabin",
     "description": "Generate scribe-fit log cabins and export them as IFC via Bonsai",
