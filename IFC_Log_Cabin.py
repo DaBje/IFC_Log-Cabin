@@ -1893,16 +1893,17 @@ class WallLine:
 
 
 def collect_wall_lines(props):
-    over = props.overhang
+    over_x = props.overhang_x
+    over_y = props.overhang_y
     length = props.length
     width = props.width
     height = props.wall_height
 
     lines = [
-        WallLine("Wall_South", "X", 0.0, -over, length + over, height),
-        WallLine("Wall_North", "X", width, -over, length + over, height),
-        WallLine("Wall_West", "Y", 0.0, -over, width + over, height),
-        WallLine("Wall_East", "Y", length, -over, width + over, height),
+        WallLine("Wall_South", "X", 0.0, -over_x, length + over_x, height),
+        WallLine("Wall_North", "X", width, -over_x, length + over_x, height),
+        WallLine("Wall_West", "Y", 0.0, -over_y, width + over_y, height),
+        WallLine("Wall_East", "Y", length, -over_y, width + over_y, height),
     ]
 
     tie = props.internal_overhang
@@ -2213,10 +2214,11 @@ def generate_cabin(props):
                 by_course.setdefault(course, []).append((log, line, wall_index))
 
     # ---- floor and ceiling ------------------------------------------------
-    # The two are the same structure at different heights: members spanning
-    # between opposite wall courses in whichever style is chosen. Only the
-    # bearing course differs, and what sits around it - a floor is carried on
-    # piles and locked down by the wall course above, a ceiling has neither.
+    # The two are built the same way - members spanning between opposite wall
+    # courses, boarded over - but they are not the same thing, so each picks
+    # its own style and either can be left out. What differs is the bearing
+    # course and what sits around it: a floor is carried on piles and locked
+    # down by the wall course above, a ceiling has neither.
     joists = []
     boxes = []
     floor_piles = []
@@ -2227,16 +2229,18 @@ def generate_cabin(props):
 
     levels = []
     if props.floor_type != "NONE":
-        levels.append(("Floor", parity, True, True, None))
+        levels.append(("Floor", props.floor_type, parity, True, True, None))
 
+    if props.ceiling_type != "NONE":
         # Bear the ceiling on the topmost course running the right way.
         top_course = None
         for course in range(max_courses - 1, -1, -1):
             if course % 2 == parity and lines_at(course):
                 top_course = course
                 break
-        if props.add_ceiling and top_course is not None:
-            if props.floor_type == "NOTCHED":
+
+        if top_course is not None:
+            if props.ceiling_type == "NOTCHED":
                 # Drop the logs a round so the top wall course lands on top of
                 # them and can be notched over them - the same lock-in the
                 # floor logs get. It also buries the ceiling build-up within
@@ -2250,11 +2254,12 @@ def generate_cabin(props):
             if ceiling_bearer > parity:
                 # Hung from a level worked out at the crown, so the deck over
                 # the joists finishes level with it.
-                sheet = props.sheet_thickness if props.add_deck else 0.0
+                sheet = props.sheet_thickness
                 crown = course_z(ceiling_bearer) + mean_r
                 levels.append(
                     (
                         "Ceiling",
+                        props.ceiling_type,
                         ceiling_bearer,
                         False,
                         True,
@@ -2262,7 +2267,7 @@ def generate_cabin(props):
                     )
                 )
 
-    for prefix, bearer_course, add_piles, tie_above, hung_base in levels:
+    for prefix, style, bearer_course, add_piles, tie_above, hung_base in levels:
         if along_y:
             span_end = props.width
             free_end = props.length
@@ -2351,7 +2356,7 @@ def generate_cabin(props):
                         "sheet",
                     )
 
-        if props.floor_type == "NOTCHED":
+        if style == "NOTCHED":
             # The outermost logs sit a set distance in from the walls, centre
             # to centre, and the run between them is on the nominal pitch with
             # the end bays absorbing the remainder - the bracket joists' rule
@@ -2379,7 +2384,7 @@ def generate_cabin(props):
         deck_layers = []
         face = mean_r
 
-        if props.floor_type == "NOTCHED":
+        if style == "NOTCHED":
             level_beams = []  # this level's logs, for the tie-in below
             r_joist = props.joist_diameter / 2.0
             axis_z = sill_z + half_rise  # a course above its bearer, as a wall log would be
@@ -2523,7 +2528,7 @@ def generate_cabin(props):
             # A sheet goes down on the logs first, so the beams start one
             # thickness higher. The void it closes off between the beams is
             # what takes the insulation.
-            sheet = props.sheet_thickness if props.add_deck else 0.0
+            sheet = props.sheet_thickness
             beam_base = joist_flat + sheet
 
             for index, seat in enumerate(cross_at):
@@ -2558,7 +2563,7 @@ def generate_cabin(props):
             if hung_base is not None:
                 underside = hung_base
             else:
-                underside = props.sheet_thickness if props.add_deck else 0.0
+                underside = props.sheet_thickness
             joist_top = underside + props.joist_depth
 
             # Mill the inner face of the sills the brackets bear against, down
@@ -2636,12 +2641,15 @@ def generate_cabin(props):
                 )
 
                 # One L-shaped bracket per end, rather than a seat and an
-                # upright meeting in mid air.
-                ends = (
+                # upright meeting in mid air. Named for what it holds and not
+                # "ends", which is the notched branch's helper - the two
+                # branches share this scope, and a bracket floor runs before a
+                # notched ceiling gets to call it.
+                bracket_ends = (
                     (near_end, near_plate, near_seat),
                     (far_end, far_plate, far_seat),
                 )
-                for side, (outer, inner, tail) in enumerate(ends):
+                for side, (outer, inner, tail) in enumerate(bracket_ends):
                     profile = [
                         (outer, underside),
                         (tail, underside),
@@ -2678,9 +2686,8 @@ def generate_cabin(props):
             ]
 
         # ---- plywood ---------------------------------------------------
-        if props.add_deck:
-            for layer in deck_layers:
-                lay_sheets(*layer)
+        for layer in deck_layers:
+            lay_sheets(*layer)
 
     # ---- roof ---------------------------------------------------------------
     # Gables carried up in logs on the wall's own course rhythm, so each one
@@ -2692,6 +2699,10 @@ def generate_cabin(props):
         gable_lines = (2, 3) if ridge_x else (0, 1)
         slope_span = props.width if ridge_x else props.length
         run_end = props.length if ridge_x else props.width
+        # Logs down the slope (the gable walls) and logs along the ridge
+        # (eave walls, purlins) each project by their own axis' overhang.
+        over_slope = props.overhang_y if ridge_x else props.overhang_x
+        over_run = props.overhang_x if ridge_x else props.overhang_y
 
         occupied = [c for c in range(max_courses) if lines_at(c)]
         gable_top = max(
@@ -2726,7 +2737,7 @@ def generate_cabin(props):
 
             # The top wall log is what the first gable log grooves onto.
             below = {
-                index: (-props.overhang, slope_span + props.overhang,
+                index: (-over_slope, slope_span + over_slope,
                         flipped(gable_top, index))
                 for index in gable_lines
             }
@@ -2778,7 +2789,7 @@ def generate_cabin(props):
             if deepest_course is not None:
                 crown_ref = course_z(max(0, deepest_course - 2)) + mean_r
                 deck_overhang = min(
-                    props.overhang, max(0.0, (wall_top - crown_ref) / math.tan(pitch))
+                    over_slope, max(0.0, (wall_top - crown_ref) / math.tan(pitch))
                 )
 
             gable_members = []  # (log, line index, low, high) for tying in
@@ -3062,11 +3073,11 @@ def generate_cabin(props):
                     z = max(z, rest_surface)
 
                 if ridge_x:
-                    p0 = Vector((-props.overhang, across, z))
-                    p1 = Vector((run_end + props.overhang, across, z))
+                    p0 = Vector((-over_run, across, z))
+                    p1 = Vector((run_end + over_run, across, z))
                 else:
-                    p0 = Vector((across, -props.overhang, z))
-                    p1 = Vector((across, run_end + props.overhang, z))
+                    p0 = Vector((across, -over_run, z))
+                    p1 = Vector((across, run_end + over_run, z))
 
                 beam = Log(
                     p0, p1, radius, radius, rng,
@@ -3170,7 +3181,7 @@ def generate_cabin(props):
             # rake cut stops being needed, past the wall face by however far
             # into the overhang that boundary actually sits.
             d_max = (half + deck_overhang) / cos_p
-            along_lo, along_hi = -props.overhang, run_end + props.overhang
+            along_lo, along_hi = -over_run, run_end + over_run
 
             def roof_point(along, d, s):
                 return (
@@ -3930,12 +3941,19 @@ class LOGCABIN_InternalWall(bpy.types.PropertyGroup):
 
 class LOGCABIN_Props(bpy.types.PropertyGroup):
     # footprint
-    length: FloatProperty(name="Length (X)", default=8.0, min=1.0, unit="LENGTH")
-    width: FloatProperty(name="Width (Y)", default=5.0, min=1.0, unit="LENGTH")
-    wall_height: FloatProperty(name="Wall Height", default=2.6, min=0.3, unit="LENGTH")
-    overhang: FloatProperty(
-        name="Corner Overhang",
-        description="How far log ends project past the corner",
+    length: FloatProperty(name="Length (X)", description="Outside length of the cabin, along the X axis", default=8.0, min=1.0, unit="LENGTH")
+    width: FloatProperty(name="Width (Y)", description="Outside width of the cabin, along the Y axis", default=5.0, min=1.0, unit="LENGTH")
+    wall_height: FloatProperty(name="Wall Height", description="Height the wall logs are stacked to, before the gables", default=2.6, min=0.3, unit="LENGTH")
+    overhang_x: FloatProperty(
+        name="Corner Overhang X",
+        description="How far the ends of logs running along X project past the corner",
+        default=0.35,
+        min=0.0,
+        unit="LENGTH",
+    )
+    overhang_y: FloatProperty(
+        name="Corner Overhang Y",
+        description="How far the ends of logs running along Y project past the corner",
         default=0.35,
         min=0.0,
         unit="LENGTH",
@@ -3949,12 +3967,12 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         min=0.5,
         unit="LENGTH",
     )
-    pile_diameter: FloatProperty(name="Pile Diameter", default=0.3, min=0.05, unit="LENGTH")
-    pile_height: FloatProperty(name="Pile Height", default=0.6, min=0.0, unit="LENGTH")
+    pile_diameter: FloatProperty(name="Pile Diameter", description="Diameter of each foundation pile", default=0.3, min=0.05, unit="LENGTH")
+    pile_height: FloatProperty(name="Pile Height", description="How far each pile stands above ground. Zero leaves the cabin on the ground", default=0.6, min=0.0, unit="LENGTH")
 
     # logs
-    butt_diameter: FloatProperty(name="Butt Diameter", default=0.30, min=0.05, unit="LENGTH")
-    top_diameter: FloatProperty(name="Top Diameter", default=0.24, min=0.05, unit="LENGTH")
+    butt_diameter: FloatProperty(name="Butt Diameter", description="Diameter at a log's thick end. Every log tapers from this to the top diameter", default=0.30, min=0.05, unit="LENGTH")
+    top_diameter: FloatProperty(name="Top Diameter", description="Diameter at a log's thin end", default=0.24, min=0.05, unit="LENGTH")
     scribe_depth: FloatProperty(
         name="Scribe Depth",
         description="How deeply each log settles into the one below",
@@ -3996,6 +4014,7 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
     # floor
     floor_type: EnumProperty(
         name="Floor",
+        description="How the floor is carried, or none for an open frame",
         items=[
             ("NONE", "None", "No floor structure"),
             (
@@ -4016,6 +4035,7 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
     )
     joist_axis: EnumProperty(
         name="Joist Direction",
+        description="Which way the floor members span",
         items=[
             ("Y", "Along Y", "Joists span the width, bearing on the X walls"),
             ("X", "Along X", "Joists span the length, bearing on the Y walls"),
@@ -4033,7 +4053,8 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         unit="LENGTH",
     )
     joist_diameter: FloatProperty(
-        name="Joist Diameter", default=0.20, min=0.05, unit="LENGTH"
+        name="Joist Diameter",
+        description="Diameter of the round logs used as floor beams", default=0.20, min=0.05, unit="LENGTH"
     )
     log_beam_offset: FloatProperty(
         name="Log Offset",
@@ -4053,13 +4074,9 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         unit="LENGTH",
     )
     # roof
-    add_roof: BoolProperty(
-        name="Roof Frame",
-        description="Carry the gables up in logs and span a ridge and purlins between them",
-        default=True,
-    )
     ridge_axis: EnumProperty(
         name="Ridge",
+        description="Which way the ridge runs. The gables are the two walls across it",
         items=[
             ("X", "Along X", "Ridge runs the length; the gables are the Y walls"),
             ("Y", "Along Y", "Ridge runs the width; the gables are the X walls"),
@@ -4074,10 +4091,12 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         max=80.0,
     )
     ridge_diameter: FloatProperty(
-        name="Ridge Diameter", default=0.26, min=0.05, unit="LENGTH"
+        name="Ridge Diameter",
+        description="Diameter of the ridge log at the peak", default=0.26, min=0.05, unit="LENGTH"
     )
     purlin_diameter: FloatProperty(
-        name="Purlin Diameter", default=0.20, min=0.05, unit="LENGTH"
+        name="Purlin Diameter",
+        description="Diameter of the purlins between the ridge and the eaves", default=0.20, min=0.05, unit="LENGTH"
     )
     purlin_spacing: FloatProperty(
         name="Purlin Spacing",
@@ -4095,10 +4114,14 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         ),
         default=True,
     )
+
+    def _get_add_rafters(self):
+        return self.roof_covering != "NONE"
+
     add_rafters: BoolProperty(
         name="Rafters",
-        description="Lay rafters on top of the roof deck, running down the slope",
-        default=True,
+        description="Whether rafters are built - a roof always has them",
+        get=_get_add_rafters,
     )
     rafter_diameter: FloatProperty(
         name="Rafter Diameter",
@@ -4145,20 +4168,39 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         default=True,
     )
     lath_width: FloatProperty(
-        name="Lath Width", default=0.05, min=0.02, unit="LENGTH"
+        name="Lath Width",
+        description="Width of each ventilation lath, across the slope", default=0.05, min=0.02, unit="LENGTH"
     )
     lath_thickness: FloatProperty(
-        name="Lath Thickness", default=0.025, min=0.01, unit="LENGTH"
+        name="Lath Thickness",
+        description="Thickness of each lath, and so the depth of the air gap under the covering", default=0.025, min=0.01, unit="LENGTH"
     )
+
+    def _get_add_roof(self):
+        return self.roof_covering != "NONE"
+
+    def _set_add_roof(self, value):
+        self.roof_covering = "STONE" if value else "NONE"
+
     roof_covering: EnumProperty(
-        name="Roof Covering",
+        name="Roof",
+        description=(
+            "What the cabin is roofed in. Anything but None builds the whole "
+            "roof - gables, frame and all - clad in that"
+        ),
         items=[
-            ("NONE", "None", "No covering - laths left exposed"),
+            ("NONE", "None", "No roof at all"),
             ("SHINGLES", "Wooden Shingles", "Overlapping wooden shingle courses"),
-            ("STONE", "Stone", "Overlapping stone slate courses"),
-            ("METAL", "Corrugated Metal", "Corrugated metal panels, one per slope"),
+            ("STONE", "Stone Shingles", "Overlapping stone slate courses"),
+            ("METAL", "Corrugated Iron", "Corrugated metal panels, one per slope"),
         ],
         default="STONE",
+    )
+    add_roof: BoolProperty(
+        name="Roof",
+        description="Whether a roof is built - follows the roof type",
+        get=_get_add_roof,
+        set=_set_add_roof,
     )
     covering_tile_width: FloatProperty(
         name="Tile Width",
@@ -4213,7 +4255,8 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         unit="LENGTH",
     )
     covering_metal_thickness: FloatProperty(
-        name="Metal Thickness", default=0.003, min=0.0005, unit="LENGTH"
+        name="Metal Thickness",
+        description="Sheet thickness of the corrugated panels", default=0.003, min=0.0005, unit="LENGTH"
     )
     add_counter_battens: BoolProperty(
         name="Counter-Battens",
@@ -4226,10 +4269,12 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         default=True,
     )
     counter_batten_width: FloatProperty(
-        name="Counter-Batten Width", default=0.04, min=0.02, unit="LENGTH"
+        name="Counter-Batten Width",
+        description="Width of each counter-batten, measured down the slope", default=0.04, min=0.02, unit="LENGTH"
     )
     counter_batten_thickness: FloatProperty(
-        name="Counter-Batten Thickness", default=0.02, min=0.01, unit="LENGTH"
+        name="Counter-Batten Thickness",
+        description="Thickness of each counter-batten, and so how far it lifts the covering", default=0.02, min=0.01, unit="LENGTH"
     )
     add_fascia: BoolProperty(
         name="Barge Boards",
@@ -4242,7 +4287,8 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         default=True,
     )
     fascia_thickness: FloatProperty(
-        name="Barge Board Thickness", default=0.025, min=0.01, unit="LENGTH"
+        name="Barge Board Thickness",
+        description="Thickness of the barge boards closing the gable ends", default=0.025, min=0.01, unit="LENGTH"
     )
     add_ridge_cap: BoolProperty(
         name="Ridge Cap",
@@ -4260,7 +4306,8 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         unit="LENGTH",
     )
     ridge_cap_metal_thickness: FloatProperty(
-        name="Metal Cap Thickness", default=0.003, min=0.0005, unit="LENGTH"
+        name="Metal Cap Thickness",
+        description="Sheet thickness of the metal ridge cap", default=0.003, min=0.0005, unit="LENGTH"
     )
     ridge_cap_wood_thickness: FloatProperty(
         name="Wood Cap Thickness",
@@ -4296,10 +4343,12 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         unit="LENGTH",
     )
     ridge_vent_length: FloatProperty(
-        name="Vent Length", default=0.10, min=0.02, unit="LENGTH"
+        name="Vent Length",
+        description="Length of each vent slot, along the ridge", default=0.10, min=0.02, unit="LENGTH"
     )
     ridge_vent_width: FloatProperty(
-        name="Vent Width", default=0.02, min=0.005, unit="LENGTH"
+        name="Vent Width",
+        description="Width of each vent slot, across the cap", default=0.02, min=0.005, unit="LENGTH"
     )
 
     joist_overhang: FloatProperty(
@@ -4323,18 +4372,32 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         min=0.0,
         max=0.45,
     )
-    add_deck: BoolProperty(
-        name="Plywood Deck",
-        description="Lay sheets over the structure, joints staggered",
-        default=True,
-    )
-    add_ceiling: BoolProperty(
+
+    ceiling_type: EnumProperty(
         name="Ceiling",
         description=(
-            "Build the same structure again at the head of the walls, in "
-            "whichever style is selected above"
+            "How the ceiling is carried at the head of the walls, or none to "
+            "leave the cabin open to the roof. It is the floor's build-up "
+            "again, but chosen on its own - the two need not match"
         ),
-        default=True,
+        items=[
+            ("NONE", "None", "No ceiling structure"),
+            (
+                "NOTCHED",
+                "Notched Logs",
+                (
+                    "Round joists notched into the walls a course down, so "
+                    "the course above lands on them and locks them in, "
+                    "flattened on top to carry the boards"
+                ),
+            ),
+            (
+                "BRACKET",
+                "Joists on Brackets",
+                "Sawn rectangular joists carried on brackets at the wall head",
+            ),
+        ],
+        default="NOTCHED",
     )
     sheet_width: FloatProperty(
         name="Sheet Width",
@@ -4351,7 +4414,8 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         unit="LENGTH",
     )
     sheet_thickness: FloatProperty(
-        name="Sheet Thickness", default=0.022, min=0.003, unit="LENGTH"
+        name="Sheet Thickness",
+        description="Thickness of the plywood sheets, on the floor and on the roof alike", default=0.022, min=0.003, unit="LENGTH"
     )
     joist_wall_gap: FloatProperty(
         name="Wall Gap",
@@ -4364,10 +4428,11 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         min=0.0,
         unit="LENGTH",
     )
-    joist_width: FloatProperty(name="Joist Width", default=0.10, min=0.02, unit="LENGTH")
-    joist_depth: FloatProperty(name="Joist Depth", default=0.20, min=0.05, unit="LENGTH")
+    joist_width: FloatProperty(name="Joist Width", description="Width of a sawn floor beam", default=0.10, min=0.02, unit="LENGTH")
+    joist_depth: FloatProperty(name="Joist Depth", description="Depth of a sawn floor beam", default=0.20, min=0.05, unit="LENGTH")
     bracket_thickness: FloatProperty(
-        name="Bracket Thickness", default=0.012, min=0.002, unit="LENGTH"
+        name="Bracket Thickness",
+        description="Thickness of the steel brackets carrying the beams", default=0.012, min=0.002, unit="LENGTH"
     )
     bracket_mill: FloatProperty(
         name="Milled Face",
@@ -4389,7 +4454,7 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
     )
 
     # natural variation
-    seed: IntProperty(name="Seed", default=1, min=0)
+    seed: IntProperty(name="Seed", description="Changes the random bow, taper and knots. Same seed, same cabin", default=1, min=0)
     bow: FloatProperty(
         name="Bow",
         description="Sideways sweep as a fraction of log length",
@@ -4917,143 +4982,85 @@ def _wrap(text, width):
     return lines
 
 
-class LOGCABIN_PT_panel(bpy.types.Panel):
-    bl_label = "Log Cabin"
-    bl_idname = "LOGCABIN_PT_panel"
+class _CabinPanel:
+    """Everything the panels share: where they live, the modern property
+    layout - labels in their own aligned column rather than each control
+    carrying its own - and the folded blocks the advanced sections are
+    grouped into."""
+
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Log Cabin"
+
+    @staticmethod
+    def body(layout):
+        column = layout.column()
+        column.use_property_split = True
+        column.use_property_decorate = False
+        return column
+
+    @classmethod
+    def fold(cls, layout, key, label):
+        """A folded block inside a panel. Returns None while it is folded, so
+        a caller can skip the work of drawing what nobody is looking at."""
+        header, panel = layout.panel(f"logcabin_{key}", default_closed=True)
+        header.label(text=label)
+        return None if panel is None else cls.body(panel)
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.log_cabin is not None
+
+
+class LOGCABIN_PT_panel(_CabinPanel, bpy.types.Panel):
+    """The one always-visible panel: the button, and nothing else."""
+
+    bl_label = "Log Cabin"
+    bl_idname = "LOGCABIN_PT_panel"
+
+    def draw(self, context):
+        self.layout.operator("logcabin.generate", icon="MOD_BUILD")
+
+
+class LOGCABIN_PT_basic(_CabinPanel, bpy.types.Panel):
+    """What the cabin is, rather than how it is put together: the size of it,
+    what it stands on, whether it has a floor, a ceiling, a roof, and what
+    that roof is clad in. Everything else is a detail of those, and lives
+    under Advanced Settings."""
+
+    bl_label = "Basic Settings"
+    bl_parent_id = "LOGCABIN_PT_panel"
 
     def draw(self, context):
         layout = self.layout
         props = context.scene.log_cabin
 
-        box = layout.box()
-        box.label(text="Footprint", icon="MESH_PLANE")
-        box.prop(props, "length")
-        box.prop(props, "width")
-        box.prop(props, "wall_height")
-        box.prop(props, "overhang")
+        body = self.body(layout)
+        body.label(text="Foundation")
+        body.prop(props, "pile_height")
+        body.prop(props, "pile_diameter")
+        body.prop(props, "max_span")
 
-        box = layout.box()
-        box.label(text="Foundation", icon="SNAP_VERTEX")
-        box.prop(props, "max_span")
-        box.prop(props, "pile_diameter")
-        box.prop(props, "pile_height")
+        body.separator()
+        body.label(text="Footprint")
+        body.prop(props, "length")
+        body.prop(props, "width")
+        body.prop(props, "wall_height")
+        body.prop(props, "overhang_x")
+        body.prop(props, "overhang_y")
+        body.prop(props, "floor_type")
 
-        box = layout.box()
-        box.label(text="Logs", icon="MOD_SKIN")
-        box.prop(props, "butt_diameter")
-        box.prop(props, "top_diameter")
-        box.prop(props, "scribe_depth")
-        box.prop(props, "scribe_gap")
-        box.prop(props, "alternate_butt")
-        box.prop(props, "sill_flat")
-        box.prop(props, "flatten_top")
-        if props.flatten_top:
-            box.prop(props, "top_flat_depth")
+        body.separator()
+        body.label(text="Ceiling and Roof")
+        body.prop(props, "ceiling_type")
+        body.prop(props, "roof_covering")
+        sub = body.column()
+        sub.enabled = props.roof_covering != "NONE"
+        sub.prop(props, "roof_pitch")
 
-        box = layout.box()
-        box.label(text="Floor", icon="MESH_GRID")
-        box.prop(props, "floor_type", expand=True)
-        if props.floor_type != "NONE":
-            box.prop(props, "joist_axis", expand=True)
-            if props.floor_type == "NOTCHED":
-                box.prop(props, "joist_diameter")
-                box.prop(props, "joist_overhang")
-                box.prop(props, "joist_flat_share")
-                box.prop(props, "log_beam_offset")
-                box.prop(props, "log_beam_spacing")
-                box.separator()
-                box.label(text="Beams across the logs", icon="MESH_CUBE")
-                box.prop(props, "joist_width")
-                box.prop(props, "joist_depth")
-                box.prop(props, "joist_spacing")
-                box.prop(props, "joist_wall_gap")
-            else:
-                box.prop(props, "joist_spacing")
-                box.prop(props, "joist_wall_gap")
-                box.prop(props, "joist_width")
-                box.prop(props, "joist_depth")
-                box.prop(props, "bracket_thickness")
-                box.prop(props, "bracket_mill")
-
-            box.separator()
-            box.prop(props, "add_ceiling")
-            box.prop(props, "add_deck")
-            if props.add_deck:
-                box.prop(props, "sheet_width")
-                box.prop(props, "sheet_length")
-                box.prop(props, "sheet_thickness")
-
-        box = layout.box()
-        box.label(text="Roof", icon="MESH_CONE")
-        box.prop(props, "add_roof")
-        if props.add_roof:
-            box.prop(props, "ridge_axis", expand=True)
-            box.prop(props, "roof_pitch")
-            box.prop(props, "ridge_diameter")
-            box.prop(props, "purlin_diameter")
-            box.prop(props, "purlin_spacing")
-            box.prop(props, "add_roof_deck")
-            box.prop(props, "add_rafters")
-            if props.add_rafters:
-                box.prop(props, "rafter_diameter")
-                box.prop(props, "rafter_height")
-                box.prop(props, "rafter_spacing")
-                box.prop(props, "noggin_thickness")
-                box.prop(props, "add_roof_sheathing2")
-                box.prop(props, "add_roof_laths")
-                if props.add_roof_laths:
-                    box.prop(props, "lath_width")
-                    box.prop(props, "lath_thickness")
-                box.prop(props, "roof_covering")
-                if props.roof_covering in ("SHINGLES", "STONE"):
-                    box.prop(props, "covering_tile_width")
-                    box.prop(props, "covering_tile_length")
-                    box.prop(props, "covering_exposure")
-                    box.prop(props, "covering_tile_thickness")
-                    box.prop(props, "add_counter_battens")
-                    if props.add_counter_battens:
-                        box.prop(props, "counter_batten_width")
-                        box.prop(props, "counter_batten_thickness")
-                elif props.roof_covering == "METAL":
-                    box.prop(props, "covering_corrugation_pitch")
-                    box.prop(props, "covering_corrugation_depth")
-                    box.prop(props, "covering_metal_thickness")
-                box.prop(props, "add_fascia")
-                if props.add_fascia:
-                    box.prop(props, "fascia_thickness")
-                if props.roof_covering != "NONE":
-                    box.prop(props, "add_ridge_cap")
-                    if props.add_ridge_cap:
-                        box.prop(props, "ridge_cap_width")
-                        if props.roof_covering == "SHINGLES":
-                            box.prop(props, "ridge_cap_wood_thickness")
-                            box.prop(props, "ridge_cap_piece_length")
-                            box.prop(props, "ridge_cap_lap")
-                        else:
-                            box.prop(props, "ridge_cap_metal_thickness")
-                        box.prop(props, "add_ridge_vents")
-                        if props.add_ridge_vents:
-                            box.prop(props, "ridge_vent_pitch")
-                            box.prop(props, "ridge_vent_length")
-                            box.prop(props, "ridge_vent_width")
-
-        box = layout.box()
-        box.label(text="Natural Variation", icon="RNDCURVE")
-        box.prop(props, "seed")
-        box.prop(props, "bow")
-        box.prop(props, "bow_vertical")
-        box.prop(props, "radial_jitter")
-        box.prop(props, "knot_density")
-        if props.knot_density > 0.0:
-            box.prop(props, "knot_size")
-            box.prop(props, "knot_rise")
-
-        box = layout.box()
-        box.label(text="Internal Walls", icon="MOD_BUILD")
-        row = box.row()
+        layout.separator()
+        self.body(layout).label(text="Internal Walls")
+        row = layout.row()
         row.template_list(
             "LOGCABIN_UL_internal",
             "",
@@ -5063,21 +5070,232 @@ class LOGCABIN_PT_panel(bpy.types.Panel):
             "active_internal",
             rows=2,
         )
-        col = row.column(align=True)
-        col.operator("logcabin.add_internal", icon="ADD", text="")
-        col.operator("logcabin.remove_internal", icon="REMOVE", text="")
-        box.prop(props, "internal_overhang")
+        column = row.column(align=True)
+        column.operator("logcabin.add_internal", icon="ADD", text="")
+        column.operator("logcabin.remove_internal", icon="REMOVE", text="")
+        self.body(layout).prop(props, "internal_overhang")
 
-        box = layout.box()
-        box.label(text="Resolution", icon="MESH_GRID")
-        box.prop(props, "axial_segments")
-        box.prop(props, "radial_segments")
-        box.prop(props, "notch_refine")
-        box.prop(props, "shade_smooth")
 
-        layout.separator()
-        layout.operator("logcabin.generate", icon="MOD_BUILD")
+class LOGCABIN_PT_advanced(_CabinPanel, bpy.types.Panel):
+    """Holds the sections below it and nothing of its own, so the whole lot
+    folds away behind one header."""
 
+    bl_label = "Advanced Settings"
+    bl_parent_id = "LOGCABIN_PT_panel"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        pass
+
+
+class LOGCABIN_PT_adv_logs(_CabinPanel, bpy.types.Panel):
+    bl_label = "Logs"
+    bl_parent_id = "LOGCABIN_PT_advanced"
+
+    def draw(self, context):
+        props = context.scene.log_cabin
+        body = self.body(self.layout)
+        body.prop(props, "butt_diameter")
+        body.prop(props, "top_diameter")
+        body.separator()
+        body.prop(props, "scribe_depth")
+        body.prop(props, "scribe_gap")
+        body.separator()
+        body.prop(props, "alternate_butt")
+        body.prop(props, "sill_flat")
+        body.prop(props, "flatten_top")
+        row = body.row()
+        row.enabled = props.flatten_top
+        row.prop(props, "top_flat_depth")
+
+
+class LOGCABIN_PT_adv_floor(_CabinPanel, bpy.types.Panel):
+    """The floor and the ceiling are built the same way and share these
+    settings, so whichever styles the two are in between them is what gets
+    shown - one of each if they differ, one if they agree."""
+
+    bl_label = "Floor & Ceiling"
+    bl_parent_id = "LOGCABIN_PT_advanced"
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.log_cabin
+        return props.floor_type != "NONE" or props.ceiling_type != "NONE"
+
+    def draw(self, context):
+        props = context.scene.log_cabin
+        body = self.body(self.layout)
+        styles = {props.floor_type, props.ceiling_type}
+        body.prop(props, "joist_axis")
+
+        if "NOTCHED" in styles:
+            body.separator()
+            body.label(text="Notched Logs")
+            body.prop(props, "log_beam_spacing")
+            body.prop(props, "log_beam_offset")
+            body.prop(props, "joist_diameter")
+            body.prop(props, "joist_overhang")
+            body.prop(props, "joist_flat_share")
+
+        if "BRACKET" in styles:
+            body.separator()
+            body.label(text="Joists on Brackets")
+            body.prop(props, "bracket_thickness")
+            body.prop(props, "bracket_mill")
+
+        # The sawn beams: the joists themselves where a level is bracket-hung,
+        # the beams crossing the logs where it is notched. Both use them, so
+        # they sit on their own rather than under either heading.
+        body.separator()
+        body.label(text="Beams")
+        body.prop(props, "joist_spacing")
+        body.prop(props, "joist_width")
+        body.prop(props, "joist_depth")
+        body.prop(props, "joist_wall_gap")
+
+
+class LOGCABIN_PT_adv_deck(_CabinPanel, bpy.types.Panel):
+    bl_label = "Decking"
+    bl_parent_id = "LOGCABIN_PT_advanced"
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.log_cabin
+        return props.floor_type != "NONE" or props.ceiling_type != "NONE"
+
+    def draw(self, context):
+        props = context.scene.log_cabin
+        body = self.body(self.layout)
+        body.label(text="Shared with the roof's own sheets")
+        body.prop(props, "sheet_width")
+        body.prop(props, "sheet_length")
+        body.prop(props, "sheet_thickness")
+
+
+class LOGCABIN_PT_adv_roof(_CabinPanel, bpy.types.Panel):
+    bl_label = "Roof"
+    bl_parent_id = "LOGCABIN_PT_advanced"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.log_cabin.add_roof
+
+    def draw(self, context):
+        props = context.scene.log_cabin
+        layout = self.layout
+        self.body(layout).prop(props, "ridge_axis")
+
+        body = self.fold(layout, "adv_roof_frame", "Frame")
+        if body is not None:
+            body.prop(props, "ridge_diameter")
+            body.prop(props, "purlin_diameter")
+            body.prop(props, "purlin_spacing")
+            body.separator()
+            body.prop(props, "add_roof_deck")
+            body.prop(props, "rafter_diameter")
+            body.prop(props, "rafter_height")
+            body.prop(props, "rafter_spacing")
+            body.prop(props, "noggin_thickness")
+
+        body = self.fold(layout, "adv_roof_buildup", "Build-up")
+        if body is not None:
+            body.prop(props, "add_roof_sheathing2")
+            body.prop(props, "add_roof_laths")
+            sub = body.column()
+            sub.enabled = props.add_roof_laths
+            sub.prop(props, "lath_width")
+            sub.prop(props, "lath_thickness")
+
+        body = self.fold(layout, "adv_roof_covering", "Covering")
+        if body is not None:
+            if props.roof_covering == "METAL":
+                body.prop(props, "covering_corrugation_pitch")
+                body.prop(props, "covering_corrugation_depth")
+                body.prop(props, "covering_metal_thickness")
+            else:
+                body.prop(props, "covering_tile_width")
+                body.prop(props, "covering_tile_length")
+                body.prop(props, "covering_exposure")
+                body.prop(props, "covering_tile_thickness")
+                body.separator()
+                body.prop(props, "add_counter_battens")
+                sub = body.column()
+                sub.enabled = props.add_counter_battens
+                sub.prop(props, "counter_batten_width")
+                sub.prop(props, "counter_batten_thickness")
+
+        body = self.fold(layout, "adv_roof_ridge", "Ridge Cap")
+        if body is not None:
+            body.prop(props, "add_ridge_cap")
+            sub = body.column()
+            sub.enabled = props.add_ridge_cap
+            sub.prop(props, "ridge_cap_width")
+            if props.roof_covering == "SHINGLES":
+                sub.prop(props, "ridge_cap_wood_thickness")
+                sub.prop(props, "ridge_cap_piece_length")
+                sub.prop(props, "ridge_cap_lap")
+            else:
+                sub.prop(props, "ridge_cap_metal_thickness")
+            sub.separator()
+            sub.prop(props, "add_ridge_vents")
+            vent = sub.column()
+            vent.enabled = props.add_ridge_vents
+            vent.prop(props, "ridge_vent_pitch")
+            vent.prop(props, "ridge_vent_length")
+            vent.prop(props, "ridge_vent_width")
+
+        body = self.fold(layout, "adv_roof_trim", "Trim")
+        if body is not None:
+            body.prop(props, "add_fascia")
+            sub = body.column()
+            sub.enabled = props.add_fascia
+            sub.prop(props, "fascia_thickness")
+
+
+class LOGCABIN_PT_adv_variation(_CabinPanel, bpy.types.Panel):
+    bl_label = "Natural Variation"
+    bl_parent_id = "LOGCABIN_PT_adv_logs"
+
+    def draw(self, context):
+        props = context.scene.log_cabin
+        body = self.body(self.layout)
+        body.prop(props, "seed")
+        body.separator()
+        body.prop(props, "bow")
+        body.prop(props, "bow_vertical")
+        body.prop(props, "radial_jitter")
+        body.separator()
+        body.prop(props, "knot_density")
+        sub = body.column()
+        sub.enabled = props.knot_density > 0.0
+        sub.prop(props, "knot_size")
+        sub.prop(props, "knot_rise")
+
+
+class LOGCABIN_PT_adv_resolution(_CabinPanel, bpy.types.Panel):
+    bl_label = "Mesh Resolution"
+    bl_parent_id = "LOGCABIN_PT_adv_logs"
+
+    def draw(self, context):
+        props = context.scene.log_cabin
+        body = self.body(self.layout)
+        body.prop(props, "shade_smooth")
+        body.separator()
+        body.prop(props, "axial_segments")
+        body.prop(props, "radial_segments")
+        body.prop(props, "notch_refine")
+
+
+class LOGCABIN_PT_ifc(_CabinPanel, bpy.types.Panel):
+    """Export is its own errand, not a setting, so it sits on its own at the
+    bottom rather than under Advanced."""
+
+    bl_label = "IFC Export"
+    bl_parent_id = "LOGCABIN_PT_panel"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
         ok, message, _ = _ifc_state()
         if not ok:
             warn = layout.box()
@@ -5101,7 +5319,18 @@ CLASSES = (
     LOGCABIN_OT_generate,
     LOGCABIN_OT_to_ifc,
     LOGCABIN_UL_internal,
+    # The parent has to register before anything naming it as its parent,
+    # and sections appear in the order they are registered.
     LOGCABIN_PT_panel,
+    LOGCABIN_PT_basic,
+    LOGCABIN_PT_advanced,
+    LOGCABIN_PT_adv_logs,
+    LOGCABIN_PT_adv_variation,
+    LOGCABIN_PT_adv_resolution,
+    LOGCABIN_PT_adv_floor,
+    LOGCABIN_PT_adv_deck,
+    LOGCABIN_PT_adv_roof,
+    LOGCABIN_PT_ifc,
 )
 
 
