@@ -99,6 +99,12 @@ class Log:
                 logs resting on top at each end of flat_span, whose undersides
                 the flat runs out along. None steps straight back to full round
       floor_z - world height to saw the underside flat at, or None
+      slot0, slot1 - (half width, depth) of a spline slot sawn into the p0/p1
+                end, square across the axis and full height, or None
+      top_cuts, under_cuts - lists of (from, to, world height): the top or
+                the underside sawn flat at that height between two distances
+                along the axis, with a square step at each end - the sill
+                under an opening and the head over it
       side_flats - list of (offset along axis, half length, a_min, a_max)
                 chiselled pads that truncate the section sideways rather than
                 from above or below - a flat seat for a bracket
@@ -181,6 +187,10 @@ class Log:
         self.flat_span = None
         self.flat_shoulders = None
         self.floor_z = None
+        self.top_cuts = []
+        self.under_cuts = []
+        self.slot0 = None
+        self.slot1 = None
         self.side_flats = []
         # (slope, drop at p0, drop at p1): a sloping cut off each end, in the
         # plane of the roof.
@@ -300,7 +310,7 @@ def _floor_layout(log, n_up):
     barrel = max(2, span // 2)
     # A notch or a sawn floor is a straight line across the section, and its
     # surface is ruled across the log, so one segment per half is exact.
-    flat = 1 if (log.notches or log.floor_z is not None) else 0
+    flat = 1 if (log.notches or log.floor_z is not None or log.under_cuts) else 0
     groove = max(2, span // 2) if log.groove is not None else 0
     return barrel, flat, groove
 def _param_along(log, axis, coord):
@@ -314,6 +324,33 @@ def _param_along(log, axis, coord):
     if abs(span) < 1e-9:
         return 0.0
     return min(max((coord - start) / span, 0.0), 1.0)
+
+
+def _log_range(log, axis):
+    """(low, high) of a log's two ends along a world axis."""
+    a = log.p0.x if axis == "X" else log.p0.y
+    b = log.p1.x if axis == "X" else log.p1.y
+    return min(a, b), max(a, b)
+
+
+def _member_at(entries, wall_index, coord):
+    """(log, line) of the wall's log lying over coord, out of one course's
+    (log, line, wall index) entries, or None if the wall has no log in that
+    course at all.
+
+    A wall can carry several logs in a course once an opening splits it. If
+    none of them reaches coord - it falls in the opening - the nearest one is
+    returned, whose parameter clamps to its end, as the closest real surface
+    there is."""
+    best = None
+    for member, line, index in entries:
+        if index != wall_index:
+            continue
+        low, high = _log_range(member, line.axis)
+        miss = max(low - coord, coord - high, 0.0)
+        if best is None or miss < best[0]:
+            best = (miss, member, line)
+    return None if best is None else (best[1], best[2])
 
 
 def _top_counts(n_up):
@@ -426,6 +463,12 @@ def _ring_points(log, t, along, gap, n_up, layout):
         if top is not None and top - centre.z < r:
             ceiling = top - centre.z
 
+    # The sill under an opening: sawn level across the opening's width only.
+    for low, high, level in log.top_cuts:
+        if low <= along <= high and level - centre.z < r:
+            local = level - centre.z
+            ceiling = local if ceiling is None else min(ceiling, local)
+
     # A milled plank: flat top and bottom sawn a fixed distance apart,
     # centred on the *straight* axis, with the round sides left standing.
     # Unlike flat_z/floor_z this is local to the log's own frame rather than
@@ -523,6 +566,14 @@ def _ring_points(log, t, along, gap, n_up, layout):
         flat = log.floor_z - centre.z
         if line_top is None or flat > line_top:
             line_top = flat
+
+    # The head over an opening is the same cut again, only across the
+    # opening's width rather than the whole length.
+    for low, high, level in log.under_cuts:
+        if low <= along <= high:
+            flat = level - centre.z
+            if line_top is None or flat > line_top:
+                line_top = flat
 
     # The plank's own underside, centred on the straight axis the same way
     # its top is - see the note there on why, and drop is the same figure.
@@ -904,6 +955,22 @@ def _ring_points(log, t, along, gap, n_up, layout):
         if web < _SNAP:
             web = 0.0
 
+    # A spline slot sawn into a log end at an opening: over its depth the
+    # section is two cheeks with a gap between them, the same parting a raked
+    # end makes. Only the gap's sides differ - square walls standing from the
+    # underside to the top, rather than wings meeting on the roof plane - so
+    # the heights of those walls are handed on for the parted halves to use.
+    walls = None
+    for slot, reach in ((log.slot0, along), (log.slot1, log.length - along)):
+        if slot is None or web > 0.0:
+            continue
+        half_width, depth = slot
+        # Stations are rounded to 1e-6 of the length, which can nudge the
+        # one set on the slot's floor a micrometre inside it.
+        if reach < depth - 1e-5:
+            web = min(half_width, half * 0.8)
+            walls = (upper(web), lower(web))
+
     # Which crease slots are live creases at this station: the rim wherever
     # anything cuts the underside, the edge only while notch and groove are
     # both actually showing, and the top's own rim wherever anything cuts
@@ -913,6 +980,7 @@ def _ring_points(log, t, along, gap, n_up, layout):
         points,
         (rim > 0.0, 0.0 < edge < rim, ceiling is not None and -r < ceiling < r),
         web,
+        walls,
     )
 
 
@@ -1144,6 +1212,26 @@ def _station_params(log, axial, refine, gap=0.0, n_up=15):
         # of its vertices become pinned to the flat's rim. Pinning stations
         # either side confines that change to a few millimetres so it reads as
         # an edge rather than a smeared, torn strip.
+        # A spline slot's floor is a square step across the whole section:
+        # the ring is whole at one station and parted at the next, and the
+        # band between the two is that floor, so they sit a hair apart.
+        for slot, from_p1 in ((log.slot0, False), (log.slot1, True)):
+            if slot is None:
+                continue
+            depth = min(slot[1], log.length * 0.5)
+            for edge in (depth, depth - 2e-4):
+                along = log.length - edge if from_p1 else edge
+                params.add(round(along / log.length, 6))
+
+        # The sill and head cuts step square at each end, the same topology
+        # change, pinned the same way.
+        for low, high, _level in log.top_cuts + log.under_cuts:
+            for edge in (low, high):
+                for nudge in (-0.002, 0.002):
+                    param = (edge + nudge) / log.length
+                    if 0.0 <= param <= 1.0:
+                        params.add(round(param, 6))
+
         if log.flat_span is not None:
             for edge in log.flat_span:
                 for nudge in (-0.002, 0.002):
@@ -1285,12 +1373,14 @@ def build_log_mesh(log, axial, radial, gap, refine, creases=None):
 
     sections = []
     for t in params:
-        ring, live, web = _ring_points(log, t, t * log.length, gap, n_up, layout)
-        sections.append((log.axis_point(t), ring, live, web))
+        ring, live, web, walls = _ring_points(
+            log, t, t * log.length, gap, n_up, layout
+        )
+        sections.append((log.axis_point(t), ring, live, web, walls))
 
     stations = []  # (whole ring ids or None, right half ids, left half ids)
     flags = []
-    for i, (centre, ring, live, web) in enumerate(sections):
+    for i, (centre, ring, live, web, walls) in enumerate(sections):
         flags.append(live)
         if web <= 0.0:
             # Only where the ring is about to part, or has just closed up,
@@ -1307,15 +1397,21 @@ def build_log_mesh(log, axial, radial, gap, refine, creases=None):
             continue
         # Open across the middle: every slot that falls in the gap is pinned
         # to the gap's edge, on the roof plane, and the halves build apart.
-        plane = ring[mid][1]
+        # In a spline slot the edge is a square wall instead: slots over the
+        # top pin to its head and slots along the floor to its foot, and the
+        # edge between the two is the wall itself.
+        if walls is None:
+            head = foot = ring[mid][1]
+        else:
+            head, foot = walls
         right = []
         for s in right_slots:
             a, b = ring[s]
-            right.append((web, plane) if a < web else (a, b))
+            right.append((web, head if s < top_n else foot) if a < web else (a, b))
         left = []
         for s in left_slots:
             a, b = ring[s]
-            left.append((-web, plane) if a > -web else (a, b))
+            left.append((-web, head if s < top_n else foot) if a > -web else (a, b))
         stations.append((None, place(centre, right), place(centre, left)))
 
     def loop_of(corners):
@@ -2077,6 +2173,99 @@ def generate_cabin(props):
 
     total_courses = max([max_courses] + [c + 1 for c in plate_courses])
 
+    # ---- openings -----------------------------------------------------------
+    # Each opening is a box cut through its wall: along the wall from one
+    # frame board's outer face to the other's, and up from where the frame
+    # stands to where the log over it is sawn off. Logs whose axis falls
+    # inside that height are cut through and stop at the frame. The log the
+    # frame stands on keeps its lower part and is sawn flat on top across the
+    # opening, and the one over the head keeps its upper part and is sawn
+    # flat underneath, clear of the head by the settling gap.
+    problems = check_openings(props)
+    if problems:
+        number, message = problems[0]
+        raise ValueError(f"Opening {number}: {message}.")
+
+    floor_top = _floor_top(props)
+    frame_t = props.opening_frame_thickness
+    cuts = {}  # wall index -> [(from, to, bottom, top)], world coordinates
+    frames = []  # (opening, line, from, to, bottom, top), for the frames
+    for opening in props.openings:
+        index = _opening_line(opening)
+        line = lines[index]
+        window = opening.kind == "WINDOW"
+        stand = floor_top + (opening.sill_height if window else 0.0)
+        # A window's frame has a sill board of its own under the opening; a
+        # door's stands straight on the floor.
+        bottom = stand - frame_t if window else stand
+        top = stand + opening.height + frame_t + props.opening_settling_gap
+        if props.opening_snap:
+            # Cutting a log exactly at its axis leaves a clean half log, never
+            # a sliver, so both cuts move to the nearest axis in this wall. A
+            # door's foot stays on the floor, wherever that falls.
+            axes = [course_z(c) for c in range(total_courses) if c % 2 == line.parity]
+            if window:
+                bottom = min(axes, key=lambda z: abs(z - bottom))
+            higher = [z for z in axes if z > bottom + half_rise]
+            if higher:
+                top = min(higher, key=lambda z: abs(z - top))
+        low = opening.position - opening.width / 2.0 - frame_t
+        high = opening.position + opening.width / 2.0 + frame_t
+        cuts.setdefault(index, []).append((low, high, bottom, top))
+
+        # The splines run only past the logs that are cut through. Just past
+        # the jamb the log under the opening is still full round, so the
+        # spline stands on its crown. The slot then runs up to the crown of
+        # the highest cut log, which is where the log over the opening beds
+        # its groove, and the spline stops the settling gap short of that -
+        # the wall has to be free to come down onto it.
+        mean_r = pair / 2.0
+        axes = [course_z(c) for c in range(total_courses) if c % 2 == line.parity]
+        spline_low = max(
+            [bottom]
+            + [z + mean_r for z in axes if z <= bottom + 1e-6 and z + mean_r > bottom]
+        )
+        cut_through = [z for z in axes if bottom + 1e-6 < z < top - 1e-6]
+        slot_top = max(cut_through) + mean_r if cut_through else spline_low
+        frames.append((opening, line, low, high, bottom, top, spline_low, slot_top))
+
+    def pieces(line, course, wall_index):
+        """The logs this line carries at this course, as (p0, p1, r0, r1,
+        cut0, cut1): the ends, the radius at each end, and whether each end
+        was cut at an opening. One corner-to-corner log, split wherever an
+        opening passes through this course. Each piece keeps the radius the
+        whole log would have had there, so the taper still runs across the
+        gap and the wall rises level."""
+        p_start, p_end = ends(line, course, wall_index)
+        z = course_z(course)
+        start = p_start.x if line.axis == "X" else p_start.y
+        run = (p_end.x if line.axis == "X" else p_end.y) - start
+        gaps = sorted(
+            tuple(sorted(((low - start) / run, (high - start) / run)))
+            for low, high, bottom, top in cuts.get(wall_index, [])
+            if bottom + 1e-6 < z < top - 1e-6
+        )
+        if not gaps:
+            return [(p_start, p_end, r_butt, r_top, False, False)]
+        spans = []
+        u = 0.0
+        for g0, g1 in gaps:
+            spans.append((u, g0))
+            u = g1
+        spans.append((u, 1.0))
+        return [
+            (
+                p_start.lerp(p_end, u0),
+                p_start.lerp(p_end, u1),
+                _lerp(r_butt, r_top, u0),
+                _lerp(r_butt, r_top, u1),
+                u0 > 0.0,
+                u1 < 1.0,
+            )
+            for u0, u1 in spans
+            if u1 - u0 > 1e-9
+        ]
+
     records = []
     by_course = {}  # course -> [(log, line, wall_index)], for tying the floor in
     plate_logs = {}  # course -> [(log, line, wall_index)]
@@ -2095,24 +2284,20 @@ def generate_cabin(props):
         # surfaces have to agree precisely. Every log in this course is
         # already built by the time we get here, since courses are processed
         # in order and this reads only courses already finished.
-        below_logs = {
-            index: member
-            for member, _line, index in by_course.get(course - 1, [])
-            + plate_logs.get(course - 1, [])
-        }
-        two_below_logs = {
-            index: member
-            for member, _line, index in by_course.get(course - 2, [])
-            + plate_logs.get(course - 2, [])
-        }
+        below_logs = by_course.get(course - 1, []) + plate_logs.get(course - 1, [])
+        two_below_logs = by_course.get(course - 2, []) + plate_logs.get(course - 2, [])
 
-        for wall_index, line in carried(course):
-            p_start, p_end = ends(line, course, wall_index)
+        laid = [
+            (wall_index, line, piece)
+            for wall_index, line in carried(course)
+            for piece in pieces(line, course, wall_index)
+        ]
+        for wall_index, line, (p_start, p_end, r_start, r_end, cut_start, cut_end) in laid:
             log = Log(
                 p_start,
                 p_end,
-                r_butt,
-                r_top,
+                r_start,
+                r_end,
                 rng,
                 props.bow,
                 props.radial_jitter,
@@ -2126,30 +2311,24 @@ def generate_cabin(props):
             # Its taper runs opposite to this one whenever the ends alternate,
             # so a butt always beds onto a top.
             if wall_index in two_below:
-                below_member = two_below_logs.get(wall_index)
-                if below_member is not None:
-                    # The real log's radius at each of this log's own ends,
-                    # so a fat or thin neighbour is what the groove is cut to
-                    # rather than what the schedule assumes is there.
-                    coord0 = p_start.x if line.axis == "X" else p_start.y
-                    coord1 = p_end.x if line.axis == "X" else p_end.y
-                    log.groove = (
-                        round_rise,
-                        below_member.radius(
-                            _param_along(below_member, line.axis, coord0)
-                        ),
-                        below_member.radius(
-                            _param_along(below_member, line.axis, coord1)
-                        ),
-                    )
-                else:
-                    opposed = flipped(course - 2, wall_index) != flipped(
-                        course, wall_index
-                    )
-                    if opposed:
-                        log.groove = (round_rise, r_top, r_butt)
+                # The real log's radius at each of this log's own ends, so a
+                # fat or thin neighbour is what the groove is cut to rather
+                # than what the schedule assumes is there. Each end asks for
+                # whichever log lies under it, since an opening can split the
+                # course below differently from this one.
+                coord0 = p_start.x if line.axis == "X" else p_start.y
+                coord1 = p_end.x if line.axis == "X" else p_end.y
+                radii = []
+                for coord in (coord0, coord1):
+                    found = _member_at(two_below_logs, wall_index, coord)
+                    if found is None:
+                        radii.append(radius_at(line, course - 2, wall_index, coord))
                     else:
-                        log.groove = (round_rise, r_butt, r_top)
+                        below_member = found[0]
+                        radii.append(below_member.radius(
+                            _param_along(below_member, line.axis, coord)
+                        ))
+                log.groove = (round_rise, radii[0], radii[1])
 
             # Saddle notches over every crossing log one course down.
             for cross_index, cross in below:
@@ -2162,7 +2341,8 @@ def generate_cabin(props):
                 if offset < -r_butt or offset > log.length + r_butt:
                     continue  # crossing lies off the end of this log
 
-                cross_member = below_logs.get(cross_index)
+                found = _member_at(below_logs, cross_index, line.position)
+                cross_member = None if found is None else found[0]
                 if cross_member is None:
                     drop = half_rise
                     radius = radius_at(cross, course - 1, cross_index, line.position)
@@ -2181,6 +2361,28 @@ def generate_cabin(props):
             # higher up the log never reaches it and the cut never binds.
             if props.sill_flat:
                 log.floor_z = 0.0
+
+            # An end cut at an opening is slotted for the jamb's spline.
+            if props.opening_splines:
+                slot = (props.opening_spline_width / 2.0, props.opening_spline_depth)
+                log.slot0 = slot if cut_start else None
+                log.slot1 = slot if cut_end else None
+
+            # The logs running on past an opening, above or below it, are
+            # sawn back to its edge across its width. A piece that stops at
+            # the frame never reaches across, so only whole spans take these.
+            z_here = course_z(course)
+            origin = p_start.x if line.axis == "X" else p_start.y
+            heading = log.dir.x if line.axis == "X" else log.dir.y
+            low_here, high_here = _log_range(log, line.axis)
+            for low, high, bottom, top in cuts.get(wall_index, []):
+                if not (low_here <= low and high <= high_here):
+                    continue
+                span = sorted(((low - origin) * heading, (high - origin) * heading))
+                if z_here <= bottom + 1e-6 and z_here + pair > bottom:
+                    log.top_cuts.append((span[0], span[1], bottom))
+                elif z_here >= top - 1e-6 and z_here - pair < top:
+                    log.under_cuts.append((span[0], span[1], top))
 
             # The top log under an eave is cut off along the roof plane. slope
             # is d(plane height)/d(a) for this log's own side vector, and the
@@ -2284,10 +2486,7 @@ def generate_cabin(props):
         # actually there rather than to the nominal schedule. A beam is
         # thinner than what it beds on, so a neighbour's jitter and bow - up
         # to about a centimetre - would otherwise show as the beam sinking in.
-        bearer_logs = {
-            index: (member, line)
-            for member, line, index in by_course.get(bearer_course, [])
-        }
+        bearer_logs = by_course.get(bearer_course, [])
         walls = (0, 1) if along_y else (2, 3)
 
         sill_z = course_z(bearer_course)
@@ -2405,10 +2604,7 @@ def generate_cabin(props):
             # - up to about a centimetre - show up as the beam sinking into
             # the log it rests on. These are the real logs, so the beams can
             # be cut to the surfaces that are actually there.
-            above_logs = {
-                index: (member, line)
-                for member, line, index in by_course.get(above_course, [])
-            }
+            above_logs = by_course.get(above_course, [])
 
             for index, pos in enumerate(positions):
                 # Run past the wall axes so each beam is let into the sill and
@@ -2438,7 +2634,7 @@ def generate_cabin(props):
                 log.flat_span = (tie, tie + span_end)
                 shoulders = []
                 for wall_index in walls:
-                    entry = above_logs.get(wall_index)
+                    entry = _member_at(above_logs, wall_index, pos)
                     if entry is None:
                         shoulders.append((mean_r, above_axis_z))
                         continue
@@ -2458,7 +2654,7 @@ def generate_cabin(props):
                     if offset < -r_joist or offset > log.length + r_joist:
                         continue  # crossing lies off the end of this joist
 
-                    entry = bearer_logs.get(bearer_index)
+                    entry = _member_at(bearer_logs, bearer_index, pos)
                     if entry is None:
                         drop, radius = half_rise, mean_r
                     else:
@@ -2487,17 +2683,17 @@ def generate_cabin(props):
             # since there is no longer a full round up there to follow.
             joist_axis = "Y" if along_y else "X"
             tie_targets = by_course.get(above_course, []) if tie_above else []
-            for log_above, line_above, index_above in tie_targets:
+            for log_above, line_above, _index_above in tie_targets:
                 if not 0.0 <= line_above.position <= span_end:
                     continue  # that wall does not pass over the joists
-                start_above, _end_above = ends(
-                    line_above, bearer_course + 2, index_above
-                )
-                origin_above = start_above.x if along_y else start_above.y
+                origin_above = log_above.p0.x if along_y else log_above.p0.y
                 heading_above = log_above.dir.x if along_y else log_above.dir.y
+                low_above, high_above = _log_range(log_above, line_above.axis)
                 for joist_index, pos in enumerate(positions):
                     if not line_above.covers(pos):
                         continue
+                    if not low_above - 1e-6 <= pos <= high_above + 1e-6:
+                        continue  # not this log's stretch of the wall
                     beam = level_beams[joist_index]
                     # Both sides measured on the real members, so the seating
                     # matches what the beam was actually cut to.
@@ -2574,11 +2770,9 @@ def generate_cabin(props):
             # tore the mesh; a continuous flat has no such transition, and
             # running the mill down the log once is what a builder would do.
             face = max(0.0, mean_r - props.bracket_mill)
-            for wall_index in walls:
-                entry = bearer_logs.get(wall_index)
-                if entry is None:
+            for member, line, wall_index in bearer_logs:
+                if wall_index not in walls:
                     continue
-                member, line = entry
                 across = (
                     Vector((0.0, 1.0, 0.0))
                     if line.axis == "X"
@@ -2730,8 +2924,14 @@ def generate_cabin(props):
             def gable_span(course):
                 """Where a gable log at this course starts and stops."""
                 z = course_z(course)
+                # When the eave walls own the top course, the first gable log
+                # sits half a round above it - a few millimetres *below* the
+                # wall top - so cut comes out slightly negative. That log still
+                # runs the full width, raked at both ends like the rest.
+                # Refusing it stopped the gable before it began, and left the
+                # ridge pieces to fill the whole triangle as split half-logs.
                 cut = (z - wall_top) * per_rise
-                if cut <= 0.0 or half - cut < pair * 0.5:
+                if half - cut < pair * 0.5:
                     return None
                 return z, cut, slope_span - cut
 
@@ -2858,10 +3058,12 @@ def generate_cabin(props):
                     )
                     # Where the roof plate under the eave crosses this log's
                     # underside, it takes the same saddle notch any crossing
-                    # log does.
-                    for plate_member, plate_line, _plate_index in plate_logs.get(
+                    # log does - and so does the eave walls' own top log, when
+                    # they end a course above the gable walls and this is the
+                    # first gable log, bearing on it at the corners.
+                    for plate_member, plate_line, _plate_index in by_course.get(
                         course - 1, []
-                    ):
+                    ) + plate_logs.get(course - 1, []):
                         across_here = p0.y if ridge_x else p0.x
                         offset = (plate_line.position - across_here) * (
                             log.dir.y if ridge_x else log.dir.x
@@ -3823,6 +4025,106 @@ def generate_cabin(props):
                             along_hi, along_hi + ft, 0.0, -ridge_reach, d_max,
                         )
 
+    # ---- door and window frames --------------------------------------------
+    # Plain sawn boards lining each opening, centred in the wall: two jambs
+    # against the cut log ends, a head across the top and, for a window, a
+    # sill across the bottom. The settling gap stays open over the head. The
+    # door leaf and the glass fill the clear opening inside the frame.
+    depth = pair * 0.7
+    gap = props.opening_settling_gap
+    for number, (
+        opening, line, low, high, bottom, top, spline_low, slot_top
+    ) in enumerate(frames, start=1):
+        window = opening.kind == "WINDOW"
+        clear_low, clear_high = low + frame_t, high - frame_t
+        head = top - gap
+        sill_top = bottom + frame_t if window else bottom
+        if head - frame_t <= sill_top:
+            continue  # snapped shut - nothing left to frame
+
+        def put(along0, along1, z0, z1, thick, line=line):
+            near, far = line.position - thick / 2.0, line.position + thick / 2.0
+            if line.axis == "X":
+                return Vector((along0, near, z0)), Vector((along1, far, z1))
+            return Vector((near, along0, z0)), Vector((far, along1, z1))
+
+        tag = f"{'Window' if window else 'Door'}_{number:02d}"
+        parts = [
+            (f"{tag}_Jamb_A", put(low, clear_low, bottom, head, depth), "frame"),
+            (f"{tag}_Jamb_B", put(clear_high, high, bottom, head, depth), "frame"),
+            (f"{tag}_Head", put(clear_low, clear_high, head - frame_t, head, depth), "frame"),
+        ]
+        # A slip joint over the head. Two boards are fixed to the sawn flat
+        # under the log over the opening, one either side of the frame's
+        # head, and the head rides between them with the movement gap above
+        # it. As the wall swells and shrinks the boards slide over the head's
+        # faces, so the joint stays closed and only timber shows. They reach
+        # down as far as they can without passing the head's underside when
+        # the gap has closed right up.
+        board = props.opening_head_board_thickness
+        clearance = 0.003
+        overlap = max(0.005, frame_t - gap)
+        inner = depth / 2.0 + clearance
+        board_low = top - gap - overlap
+        for side, sign in (("A", -1.0), ("B", 1.0)):
+            near = line.position + sign * inner
+            far = line.position + sign * (inner + board)
+            lo_across, hi_across = min(near, far), max(near, far)
+            if line.axis == "X":
+                lo = Vector((low, lo_across, board_low))
+                hi = Vector((high, hi_across, top))
+            else:
+                lo = Vector((lo_across, low, board_low))
+                hi = Vector((hi_across, high, top))
+            parts.append((f"{tag}_Head_Board_{side}", (lo, hi), "frame"))
+
+        # The gap itself is stuffed with insulation between the boards - not
+        # needed for the joint to work, but it keeps the draught out.
+        if gap > 0.0:
+            parts.append((f"{tag}_Insulation", put(low, high, head, top, depth), "insulation"))
+
+        # A spline on each jamb's outer face, running in the slot sawn down
+        # the cut log ends beside it, with the top of the slot above it left
+        # for settling and stuffed the same way.
+        spline_high = slot_top - gap
+        if props.opening_splines and spline_high > spline_low:
+            reach = props.opening_spline_depth
+            wide = props.opening_spline_width
+            for side, (near, far) in (("A", (low - reach, low)), ("B", (high, high + reach))):
+                parts.append(
+                    (f"{tag}_Spline_{side}", put(near, far, spline_low, spline_high, wide), "spline")
+                )
+                if gap > 0.0:
+                    parts.append(
+                        (
+                            f"{tag}_Spline_{side}_Insulation",
+                            put(near, far, spline_high, slot_top, wide),
+                            "insulation",
+                        )
+                    )
+        if window:
+            parts.append(
+                (f"{tag}_Sill", put(clear_low, clear_high, bottom, sill_top, depth), "frame")
+            )
+            parts.append(
+                (
+                    f"{tag}_Glass",
+                    put(clear_low, clear_high, sill_top, head - frame_t, 0.012),
+                    "window",
+                )
+            )
+        else:
+            parts.append(
+                (
+                    f"{tag}_Leaf",
+                    put(clear_low, clear_high, sill_top, head - frame_t, 0.04),
+                    "door",
+                )
+            )
+        for name, (lo, hi), kind in parts:
+            verts, faces = build_box_mesh(lo, hi)
+            boxes.append((name, verts, faces, kind))
+
     piles = []
     if props.pile_height > 0.0:
         points = dict.fromkeys(pile_positions(props), True)
@@ -3937,6 +4239,164 @@ class LOGCABIN_InternalWall(bpy.types.PropertyGroup):
         unit="LENGTH",
     )
     height: FloatProperty(name="Height", default=2.4, min=0.1, unit="LENGTH")
+
+
+# Blender only keeps the strings of a dynamic enum alive while Python holds a
+# reference to them, so the last list handed out is kept here.
+_WALL_ITEMS = []
+_WALL_NAMES = ("South", "North", "West", "East")
+
+
+def _opening_wall_items(self, context):
+    """Every wall an opening can go in: the four outer walls, then each
+    internal wall. The number is the wall's index in collect_wall_lines, so
+    the two never have to be translated."""
+    items = [
+        (f"WALL_{index}", name, f"The {name.lower()} outer wall", index)
+        for index, name in enumerate(_WALL_NAMES)
+    ]
+    # The scene that owns this opening, rather than context.scene: Blender
+    # asks for the items with no context when the value is read from Python.
+    props = getattr(self.id_data, "log_cabin", None)
+    if props is not None:
+        for index, wall in enumerate(props.internal_walls):
+            items.append(
+                (
+                    f"WALL_{4 + index}",
+                    f"Internal {index + 1}",
+                    f"Internal wall {index + 1}, running along {wall.axis}",
+                    4 + index,
+                )
+            )
+    _WALL_ITEMS[:] = items
+    return _WALL_ITEMS
+
+
+class LOGCABIN_Opening(bpy.types.PropertyGroup):
+    kind: EnumProperty(
+        name="Type",
+        items=[
+            ("DOOR", "Door", "Stands on the floor"),
+            ("WINDOW", "Window", "Sits at its sill height"),
+        ],
+        default="DOOR",
+    )
+    wall: EnumProperty(
+        name="Wall",
+        description="Which wall the opening is cut through",
+        items=_opening_wall_items,
+    )
+    position: FloatProperty(
+        name="Position",
+        description=(
+            "Centre of the opening along its wall, measured along X or Y from "
+            "the origin the same way as an internal wall's position"
+        ),
+        default=2.0,
+        unit="LENGTH",
+    )
+    width: FloatProperty(
+        name="Width",
+        description="Clear width between the frame's side boards",
+        default=0.9,
+        min=0.3,
+        unit="LENGTH",
+    )
+    height: FloatProperty(
+        name="Height",
+        description="Clear height from the sill, or from the floor for a door, to the head",
+        default=2.0,
+        min=0.3,
+        unit="LENGTH",
+    )
+    sill_height: FloatProperty(
+        name="Sill Height",
+        description="Height of a window's sill above the floor",
+        default=0.9,
+        min=0.0,
+        unit="LENGTH",
+    )
+
+
+def _floor_top(props):
+    """Height of the finished floor's top face, which a door stands on and a
+    window's sill is measured from. Worked out the same way generate_cabin
+    stacks the floor: a notched floor bears on the course running across
+    its logs, then sheet, beams and sheet; a bracket floor stands a sheet
+    off the foundation, then joists and sheet."""
+    sheet = props.sheet_thickness
+    if props.floor_type == "BRACKET":
+        return 2.0 * sheet + props.joist_depth
+    if props.floor_type == "NOTCHED":
+        r_butt = props.butt_diameter / 2.0
+        half_rise = (r_butt + props.top_diameter / 2.0 - props.scribe_depth) / 2.0
+        base_z = 0.0 if props.sill_flat else r_butt
+        parity = 0 if props.joist_axis == "Y" else 1
+        axis_z = base_z + (parity + 1) * half_rise
+        joist_flat = (
+            axis_z + props.joist_diameter / 2.0
+            - props.joist_diameter * props.joist_flat_share
+        )
+        return joist_flat + 2.0 * sheet + props.joist_depth
+    return 0.0
+
+
+def _opening_line(opening):
+    """Index of the wall line an opening is in, or None if that wall is gone
+    - an internal wall removed after the opening was placed in it."""
+    if not opening.wall:
+        return None
+    return int(opening.wall.split("_")[1])
+
+
+def check_openings(props):
+    """Problems with the openings as set, as (opening number, message). Empty
+    when every opening fits where it has been put."""
+    problems = []
+    lines = collect_wall_lines(props)
+    pair = (props.butt_diameter + props.top_diameter) / 2.0
+    clear = props.opening_min_pier
+    floor_top = _floor_top(props)
+    spans = {}  # line index -> [(low, high, number)], for the overlap check
+
+    for number, opening in enumerate(props.openings, start=1):
+        index = _opening_line(opening)
+        if index is None or index >= len(lines):
+            problems.append((number, "its wall no longer exists"))
+            continue
+        line = lines[index]
+        low = opening.position - opening.width / 2.0
+        high = opening.position + opening.width / 2.0
+
+        # Solid wall has to stand between the opening and every wall that
+        # crosses this one, for the corner or tie-in notches to bite into.
+        for other in lines:
+            if other.axis == line.axis or not other.covers(line.position):
+                continue
+            if not line.covers(other.position):
+                continue
+            if low - clear < other.position < high + clear:
+                problems.append(
+                    (
+                        number,
+                        f"too close to the {other.name[5:].replace('_', ' ')} wall",
+                    )
+                )
+                break
+
+        bottom = floor_top + (opening.sill_height if opening.kind == "WINDOW" else 0.0)
+        # At least one whole log has to run over the top, past the frame's
+        # head and the gap left for the wall settling onto it.
+        head = bottom + opening.height + props.opening_frame_thickness
+        if head + props.opening_settling_gap + pair > line.height + 1e-6:
+            problems.append((number, "too tall for its wall"))
+
+        for other_low, other_high, other_number in spans.get(index, []):
+            if low - clear < other_high and other_low < high + clear:
+                problems.append((number, f"too close to opening {other_number}"))
+        spans.setdefault(index, []).append((low, high, number))
+
+    return problems
 
 
 class LOGCABIN_Props(bpy.types.PropertyGroup):
@@ -4554,6 +5014,81 @@ class LOGCABIN_Props(bpy.types.PropertyGroup):
         unit="LENGTH",
     )
 
+    # openings
+    openings: CollectionProperty(type=LOGCABIN_Opening)
+    active_opening: IntProperty(default=0)
+    opening_snap: BoolProperty(
+        name="Snap to Courses",
+        description=(
+            "Move each head and sill to the nearest course, so no thin sliver "
+            "of log is left above or below an opening"
+        ),
+        default=True,
+    )
+    opening_frame_thickness: FloatProperty(
+        name="Frame Thickness",
+        description="Thickness of the boards lining an opening, against the cut log ends",
+        default=0.045,
+        min=0.01,
+        unit="LENGTH",
+    )
+    opening_settling_gap: FloatProperty(
+        name="Movement Gap",
+        description=(
+            "Room left over each frame's head and each spline for the wall to "
+            "move in. The logs are taken as already settled, so this only has "
+            "to take their swelling and shrinking through the year. It is "
+            "filled with insulation and hidden behind the head boards"
+        ),
+        default=0.015,
+        min=0.0,
+        unit="LENGTH",
+    )
+    opening_head_board_thickness: FloatProperty(
+        name="Head Board Thickness",
+        description=(
+            "Thickness of the two boards fixed under the log over each "
+            "opening, one each side of the frame's head. The head slides "
+            "between them as the wall moves, so the joint stays closed"
+        ),
+        default=0.022,
+        min=0.005,
+        unit="LENGTH",
+    )
+    opening_splines: BoolProperty(
+        name="Splines",
+        description=(
+            "Key each jamb into the cut log ends: a timber on the jamb runs in "
+            "a slot sawn down the log ends, holding the wall in line while "
+            "letting it settle past the frame"
+        ),
+        default=True,
+    )
+    opening_spline_width: FloatProperty(
+        name="Spline Width",
+        description="Width of the spline and its slot, across the wall",
+        default=0.05,
+        min=0.01,
+        unit="LENGTH",
+    )
+    opening_spline_depth: FloatProperty(
+        name="Spline Depth",
+        description="How far the spline reaches into the log ends past the jamb",
+        default=0.05,
+        min=0.01,
+        unit="LENGTH",
+    )
+    opening_min_pier: FloatProperty(
+        name="Minimum Solid Wall",
+        description=(
+            "Least wall kept between an opening and a crossing wall's "
+            "centre line, or between two openings"
+        ),
+        default=0.5,
+        min=0.1,
+        unit="LENGTH",
+    )
+
 
 # --------------------------------------------------------------------------
 # operators
@@ -4586,6 +5121,48 @@ class LOGCABIN_OT_remove_internal(bpy.types.Operator):
         props = context.scene.log_cabin
         props.internal_walls.remove(props.active_internal)
         props.active_internal = max(0, props.active_internal - 1)
+        return {"FINISHED"}
+
+
+class LOGCABIN_OT_add_opening(bpy.types.Operator):
+    bl_idname = "logcabin.add_opening"
+    bl_label = "Add Opening"
+    bl_description = "Add a door or window, centred in the south wall"
+    bl_options = {"REGISTER", "UNDO"}
+
+    kind: EnumProperty(
+        items=[("DOOR", "Door", ""), ("WINDOW", "Window", "")],
+        default="DOOR",
+    )
+
+    def execute(self, context):
+        props = context.scene.log_cabin
+        opening = props.openings.add()
+        opening.kind = self.kind
+        opening.wall = "WALL_0"
+        opening.position = props.length / 2.0
+        if self.kind == "DOOR":
+            opening.width, opening.height = 0.9, 2.0
+        else:
+            opening.width, opening.height = 1.0, 1.0
+            opening.sill_height = 0.9
+        props.active_opening = len(props.openings) - 1
+        return {"FINISHED"}
+
+
+class LOGCABIN_OT_remove_opening(bpy.types.Operator):
+    bl_idname = "logcabin.remove_opening"
+    bl_label = "Remove Opening"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.log_cabin.openings) > 0
+
+    def execute(self, context):
+        props = context.scene.log_cabin
+        props.openings.remove(props.active_opening)
+        props.active_opening = max(0, props.active_opening - 1)
         return {"FINISHED"}
 
 
@@ -4666,6 +5243,10 @@ class LOGCABIN_OT_generate(bpy.types.Operator):
             message += f", {tally['bracket']} bracket parts"
         if tally.get("sheet"):
             message += f", {tally['sheet']} deck sheets"
+        if tally.get("door"):
+            message += f", {tally['door']} doors"
+        if tally.get("window"):
+            message += f", {tally['window']} windows"
         self.report({"INFO"}, message + ".")
         return {"FINISHED"}
 
@@ -4870,7 +5451,7 @@ class LOGCABIN_OT_to_ifc(bpy.types.Operator):
 
             elif kind in (
                 "joist", "bracket", "sheet", "purlin", "rafter", "lath", "covering",
-                "fascia",
+                "fascia", "frame", "spline", "insulation", "door", "window",
             ):
                 if kind == "purlin":
                     element = ifcopenshell.api.run(
@@ -4906,7 +5487,31 @@ class LOGCABIN_OT_to_ifc(bpy.types.Operator):
                         predefined_type="SHEET",
                         name=obj.name,
                     )
-                elif kind in ("lath", "fascia"):
+                elif kind == "insulation":
+                    element = ifcopenshell.api.run(
+                        "root.create_entity",
+                        ifc,
+                        ifc_class="IfcCovering",
+                        predefined_type="INSULATION",
+                        name=obj.name,
+                    )
+                elif kind == "door":
+                    element = ifcopenshell.api.run(
+                        "root.create_entity",
+                        ifc,
+                        ifc_class="IfcDoor",
+                        predefined_type="DOOR",
+                        name=obj.name,
+                    )
+                elif kind == "window":
+                    element = ifcopenshell.api.run(
+                        "root.create_entity",
+                        ifc,
+                        ifc_class="IfcWindow",
+                        predefined_type="WINDOW",
+                        name=obj.name,
+                    )
+                elif kind in ("lath", "fascia", "frame", "spline"):
                     element = ifcopenshell.api.run(
                         "root.create_entity",
                         ifc,
@@ -4964,6 +5569,14 @@ class LOGCABIN_UL_internal(bpy.types.UIList):
         row.prop(item, "axis", text="")
         row.prop(item, "position", text="Pos")
         row.prop(item, "height", text="H")
+
+
+class LOGCABIN_UL_openings(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
+        row = layout.row(align=True)
+        row.label(text=f"{index + 1} {'Door' if item.kind == 'DOOR' else 'Window'}")
+        row.prop(item, "wall", text="")
+        row.prop(item, "position", text="Pos")
 
 
 def _wrap(text, width):
@@ -5074,6 +5687,44 @@ class LOGCABIN_PT_basic(_CabinPanel, bpy.types.Panel):
         column.operator("logcabin.add_internal", icon="ADD", text="")
         column.operator("logcabin.remove_internal", icon="REMOVE", text="")
         self.body(layout).prop(props, "internal_overhang")
+
+        layout.separator()
+        self.body(layout).label(text="Doors and Windows")
+        row = layout.row()
+        row.template_list(
+            "LOGCABIN_UL_openings",
+            "",
+            props,
+            "openings",
+            props,
+            "active_opening",
+            rows=2,
+        )
+        column = row.column(align=True)
+        column.operator("logcabin.remove_opening", icon="REMOVE", text="")
+        row = layout.row(align=True)
+        row.operator("logcabin.add_opening", text="Add Door", icon="ADD").kind = "DOOR"
+        row.operator("logcabin.add_opening", text="Add Window", icon="ADD").kind = "WINDOW"
+
+        if 0 <= props.active_opening < len(props.openings):
+            opening = props.openings[props.active_opening]
+            body = self.body(layout)
+            body.prop(opening, "kind")
+            body.prop(opening, "wall")
+            body.prop(opening, "position")
+            body.prop(opening, "width")
+            body.prop(opening, "height")
+            sub = body.column()
+            sub.enabled = opening.kind == "WINDOW"
+            sub.prop(opening, "sill_height")
+
+        problems = check_openings(props)
+        if problems:
+            warn = layout.box()
+            warn.alert = True
+            for number, message in problems:
+                for index, text in enumerate(_wrap(f"Opening {number}: {message}", 34)):
+                    warn.label(text=text, icon="ERROR" if index == 0 else "BLANK1")
 
 
 class LOGCABIN_PT_advanced(_CabinPanel, bpy.types.Panel):
@@ -5252,6 +5903,31 @@ class LOGCABIN_PT_adv_roof(_CabinPanel, bpy.types.Panel):
             sub.prop(props, "fascia_thickness")
 
 
+class LOGCABIN_PT_adv_openings(_CabinPanel, bpy.types.Panel):
+    bl_label = "Doors and Windows"
+    bl_parent_id = "LOGCABIN_PT_advanced"
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.log_cabin.openings) > 0
+
+    def draw(self, context):
+        props = context.scene.log_cabin
+        body = self.body(self.layout)
+        body.prop(props, "opening_snap")
+        body.prop(props, "opening_min_pier")
+        body.separator()
+        body.prop(props, "opening_frame_thickness")
+        body.prop(props, "opening_settling_gap")
+        body.prop(props, "opening_head_board_thickness")
+        body.separator()
+        body.prop(props, "opening_splines")
+        sub = body.column()
+        sub.enabled = props.opening_splines
+        sub.prop(props, "opening_spline_width")
+        sub.prop(props, "opening_spline_depth")
+
+
 class LOGCABIN_PT_adv_variation(_CabinPanel, bpy.types.Panel):
     bl_label = "Natural Variation"
     bl_parent_id = "LOGCABIN_PT_adv_logs"
@@ -5313,12 +5989,16 @@ class LOGCABIN_PT_ifc(_CabinPanel, bpy.types.Panel):
 
 CLASSES = (
     LOGCABIN_InternalWall,
+    LOGCABIN_Opening,
     LOGCABIN_Props,
     LOGCABIN_OT_add_internal,
     LOGCABIN_OT_remove_internal,
+    LOGCABIN_OT_add_opening,
+    LOGCABIN_OT_remove_opening,
     LOGCABIN_OT_generate,
     LOGCABIN_OT_to_ifc,
     LOGCABIN_UL_internal,
+    LOGCABIN_UL_openings,
     # The parent has to register before anything naming it as its parent,
     # and sections appear in the order they are registered.
     LOGCABIN_PT_panel,
@@ -5330,6 +6010,7 @@ CLASSES = (
     LOGCABIN_PT_adv_floor,
     LOGCABIN_PT_adv_deck,
     LOGCABIN_PT_adv_roof,
+    LOGCABIN_PT_adv_openings,
     LOGCABIN_PT_ifc,
 )
 
